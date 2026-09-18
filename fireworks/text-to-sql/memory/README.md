@@ -1,0 +1,1 @@
+Agents: Use this directory freely to manage resources and context during the exploration, planning, and validation tasks!
