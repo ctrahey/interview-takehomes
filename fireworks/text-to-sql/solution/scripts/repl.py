@@ -31,6 +31,7 @@ sys.path.insert(0, str(REPO / "packages" / "t2s_core" / "src"))
 
 import sqlglot  # noqa: E402
 from pydantic import SecretStr  # noqa: E402
+
 from t2s_core import (  # noqa: E402
     EphemeralSqliteValidator,
     FireworksClient,
@@ -44,8 +45,13 @@ CORPUS = REPO / "evals" / "corpus" / "schemas"
 ROW_CAP = 50
 
 _C = {
-    "dim": "\033[2m", "b": "\033[1m", "r": "\033[31m", "g": "\033[32m",
-    "y": "\033[33m", "c": "\033[36m", "x": "\033[0m",
+    "dim": "\033[2m",
+    "b": "\033[1m",
+    "r": "\033[31m",
+    "g": "\033[32m",
+    "y": "\033[33m",
+    "c": "\033[36m",
+    "x": "\033[0m",
 }
 if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
     _C = dict.fromkeys(_C, "")
@@ -179,12 +185,11 @@ def run_sql(schema: Schema, sql: str) -> None:
         return
     headers = [d[0] for d in cur.description]
     widths = [
-        min(28, max(len(h), max(len(str(row[i])) for row in rows)))
-        for i, h in enumerate(headers)
+        min(28, max(len(h), *(len(str(row[i])) for row in rows))) for i, h in enumerate(headers)
     ]
-    say(c("b", "  " + "  ".join(h[:w].ljust(w) for h, w in zip(headers, widths))))
+    say(c("b", "  " + "  ".join(h[:w].ljust(w) for h, w in zip(headers, widths, strict=True))))
     for row in rows:
-        say("  " + "  ".join(str(v)[:w].ljust(w) for v, w in zip(row, widths)))
+        say("  " + "  ".join(str(v)[:w].ljust(w) for v, w in zip(row, widths, strict=True)))
     more = " (capped)" if len(rows) == ROW_CAP else ""
     say(c("dim", f"  {len(rows)} row(s){more}"))
 
@@ -201,41 +206,100 @@ def build_summary(correctives: list[str]) -> str | None:
     )
 
 
-def main() -> None:
-    ref = sys.argv[1] if len(sys.argv) > 1 else "retail"
-    try:
-        schema = Schema.load(ref)
-    except FileNotFoundError as exc:
-        sys.exit(str(exc))
+class Repl:
+    """Conversation state for one session. Superseded by `t2s-chat` (W10)."""
 
-    client = FireworksClient(FireworksConfig(api_key=SecretStr(load_key())))
-    validator = EphemeralSqliteValidator()
-    correctives: list[str] = []
-    last_question: str | None = None
-    last_sql: str | None = None
+    def __init__(self, schema: Schema) -> None:
+        self.schema = schema
+        self.client = FireworksClient(FireworksConfig(api_key=SecretStr(load_key())))
+        self.validator = EphemeralSqliteValidator()
+        self.correctives: list[str] = []
+        self.last_question: str | None = None
+        self.last_sql: str | None = None
 
-    say(c("b", f"\ntext-to-SQL · schema {schema.name} · {len(schema.tables())} tables"))
-    say(c("dim", f"  {', '.join(schema.tables())}"))
-    say(c("dim", "  ask a question, or /help\n"))
-
-    def ask(question: str) -> None:
-        nonlocal last_sql, last_question
-        last_question = question
+    def ask(self, question: str) -> None:
+        self.last_question = question
         try:
             result = generate_query(
                 QueryRequest(
                     question=question,
-                    schema_ddl=schema.ddl,
+                    schema_ddl=self.schema.ddl,
                     dialect="sqlite",
-                    session_summary=build_summary(correctives),
+                    session_summary=build_summary(self.correctives),
                 ),
-                client=client,
-                validator=validator,
+                client=self.client,
+                validator=self.validator,
             )
         except Exception as exc:
             say(c("r", f"  {type(exc).__name__}: {exc}"))
             return
-        last_sql = show_result(result, correctives)
+        self.last_sql = show_result(result, self.correctives)
+
+    def add_corrective(self, text: str) -> None:
+        if not text:
+            say(c("y", "  usage: /fix <correction>"))
+            return
+        self.correctives.append(text)
+        say(c("g", f"  corrective {len(self.correctives)} recorded"))
+        if self.last_question:
+            say(c("dim", f"  re-asking: {self.last_question}"))
+            self.ask(self.last_question)
+
+    def show_correctives(self) -> None:
+        if not self.correctives:
+            say(c("dim", "  none"))
+        for i, text in enumerate(self.correctives, 1):
+            say(f"  {i}. {text}")
+
+    def switch_schema(self, ref: str) -> None:
+        try:
+            self.schema = Schema.load(ref)
+        except FileNotFoundError as exc:
+            say(c("r", f"  {exc}"))
+            return
+        self.last_sql = None
+        say(c("g", f"  schema {self.schema.name}: {', '.join(self.schema.tables())}"))
+
+    def command(self, cmd: str, arg: str) -> bool:
+        """Handle a slash command. Returns False to exit."""
+        if cmd in ("/quit", "/exit", "/q"):
+            return False
+        elif cmd == "/help":
+            say(__doc__ or "")
+        elif cmd == "/fix":
+            self.add_corrective(arg)
+        elif cmd == "/again":
+            self.ask(self.last_question) if self.last_question else say(c("y", "  nothing asked"))
+        elif cmd == "/run":
+            run_sql(self.schema, self.last_sql) if self.last_sql else say(c("y", "  no SQL"))
+        elif cmd == "/sql":
+            say("    " + pretty(self.last_sql).replace("\n", "\n    ")) if self.last_sql else say(
+                c("dim", "  none")
+            )
+        elif cmd == "/correctives":
+            self.show_correctives()
+        elif cmd == "/undo":
+            say(c("g", f"  dropped: {self.correctives.pop()}") if self.correctives else "  none")
+        elif cmd == "/clear":
+            self.correctives.clear()
+            say(c("g", "  correctives cleared"))
+        elif cmd == "/schema":
+            self.switch_schema(arg)
+        else:
+            say(c("y", f"  unknown command {cmd} — /help"))
+        return True
+
+
+def main() -> None:
+    ref = sys.argv[1] if len(sys.argv) > 1 else "retail"
+    try:
+        repl = Repl(Schema.load(ref))
+    except FileNotFoundError as exc:
+        sys.exit(str(exc))
+
+    say(c("b", f"\ntext-to-SQL · schema {repl.schema.name}"))
+    say(c("dim", f"  {', '.join(repl.schema.tables())}"))
+    say(c("dim", "  ask a question, or /help\n"))
 
     while True:
         try:
@@ -245,61 +309,12 @@ def main() -> None:
             return
         if not line:
             continue
-
         if not line.startswith("/"):
-            ask(line)
+            repl.ask(line)
             continue
-
         cmd, _, arg = line.partition(" ")
-        arg = arg.strip()
-
-        if cmd in ("/quit", "/exit", "/q"):
+        if not repl.command(cmd, arg.strip()):
             return
-        elif cmd == "/help":
-            say(__doc__ or "")
-        elif cmd == "/fix":
-            if not arg:
-                say(c("y", "  usage: /fix <correction>"))
-            else:
-                correctives.append(arg)
-                say(c("g", f"  corrective {len(correctives)} recorded"))
-                if last_question:
-                    say(c("dim", f"  re-asking: {last_question}"))
-                    ask(last_question)
-        elif cmd == "/again":
-            if last_question:
-                ask(last_question)
-            else:
-                say(c("y", "  nothing asked yet"))
-        elif cmd == "/run":
-            if last_sql:
-                run_sql(schema, last_sql)
-            else:
-                say(c("y", "  no valid SQL to run"))
-        elif cmd == "/sql":
-            if last_sql:
-                say("    " + pretty(last_sql).replace("\n", "\n    "))
-            else:
-                say(c("dim", "  none"))
-        elif cmd == "/correctives":
-            if not correctives:
-                say(c("dim", "  none"))
-            for i, t in enumerate(correctives, 1):
-                say(f"  {i}. {t}")
-        elif cmd == "/undo":
-            say(c("g", f"  dropped: {correctives.pop()}") if correctives else c("y", "  none"))
-        elif cmd == "/clear":
-            correctives.clear()
-            say(c("g", "  correctives cleared"))
-        elif cmd == "/schema":
-            try:
-                schema = Schema.load(arg)
-                last_sql = None
-                say(c("g", f"  schema {schema.name}: {', '.join(schema.tables())}"))
-            except FileNotFoundError as exc:
-                say(c("r", f"  {exc}"))
-        else:
-            say(c("y", f"  unknown command {cmd} — /help"))
 
 
 if __name__ == "__main__":
