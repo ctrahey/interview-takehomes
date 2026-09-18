@@ -28,6 +28,15 @@ text anywhere in this module):
    inside a subquery). This is belt-and-suspenders: no known SQLite grammar
    admits a DML/DDL statement as a sub-expression of a `SELECT`, but the
    check costs nothing and fails closed if that assumption is ever wrong.
+
+D12: the same walk also denies references to the SQLite catalog tables
+(`sqlite_master` / `sqlite_schema`) by default. `SELECT sql FROM
+sqlite_master` is a perfectly legitimate single read-only SELECT and passes
+every other rule above on its merits (see W1 finding #8) -- but against a
+persisted, potentially shared sample database, catalog enumeration is
+reconnaissance, not a query the user's own schema answers. Callers that have
+a deliberate reason to allow it (there are none in this codebase yet) opt in
+explicitly with `allow_catalog=True`; the default stays closed.
 """
 
 from __future__ import annotations
@@ -58,16 +67,32 @@ _DENYLIST_ANYWHERE: tuple[type[exp.Expression], ...] = (
     exp.Merge,
 )
 
+#: D12. Lower-cased table names; comparison is case-insensitive because SQL
+#: identifiers are by default.
+_CATALOG_TABLES: frozenset[str] = frozenset({"sqlite_master", "sqlite_schema"})
+
 
 class UnsafeQueryError(ValueError):
     """Raised when a query fails the D9 safety gate."""
 
 
-def assert_safe_select(sql: str, dialect: str) -> exp.Expression:
+class CatalogAccessDeniedError(UnsafeQueryError):
+    """D12: the query references `sqlite_master`/`sqlite_schema` without `allow_catalog=True`.
+
+    Kept as its own subclass (rather than a generic `UnsafeQueryError`) so a
+    caller -- notably the API layer -- can catch it specifically and answer
+    with a clear refusal that points at the deterministic CRUD endpoints,
+    instead of a generic "malformed query" message.
+    """
+
+
+def assert_safe_select(sql: str, dialect: str, *, allow_catalog: bool = False) -> exp.Expression:
     """Validate `sql` against the D9 safety gate; return the parsed AST if it passes.
 
     Raises `UnsafeQueryError` (never a bare parser exception) describing
-    which rule was violated.
+    which rule was violated. Raises the more specific `CatalogAccessDeniedError`
+    (D12) when the statement references the SQLite catalog and
+    `allow_catalog` is not explicitly set to `True`.
     """
     try:
         statements = [s for s in sqlglot.parse(sql, read=dialect) if s is not None]
@@ -89,5 +114,16 @@ def assert_safe_select(sql: str, dialect: str) -> exp.Expression:
     for node in stmt.walk():
         if isinstance(node, _DENYLIST_ANYWHERE):
             raise UnsafeQueryError(f"disallowed construct {type(node).__name__!r} found in query")
+        if (
+            not allow_catalog
+            and isinstance(node, exp.Table)
+            and node.name.lower() in _CATALOG_TABLES
+        ):
+            raise CatalogAccessDeniedError(
+                f"access to catalog table {node.name!r} is denied by default (D12); "
+                "ask 'what tables/columns exist' through the deterministic CRUD endpoints "
+                "(e.g. GET /schemas/{id}) instead, or pass allow_catalog=True to opt in "
+                "explicitly"
+            )
 
     return stmt

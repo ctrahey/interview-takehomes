@@ -933,6 +933,7 @@ source = { editable = "packages/cli" }
 dependencies = [
     { name = "click" },
     { name = "foundation" },
+    { name = "sqlglot" },
     { name = "t2s-core" },
 ]
 
@@ -940,6 +941,7 @@ dependencies = [
 requires-dist = [
     { name = "click", specifier = ">=8.1" },
     { name = "foundation", editable = "packages/foundation" },
+    { name = "sqlglot", specifier = ">=25.0" },
     { name = "t2s-core", editable = "packages/t2s_core" },
 ]
 

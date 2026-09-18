@@ -10,7 +10,7 @@ import pytest
 from foundation import sample_db
 from foundation.ddl import render_ddl
 from foundation.graph import Column, EntityGraph, Table
-from foundation.security import UnsafeQueryError
+from foundation.security import CatalogAccessDeniedError, UnsafeQueryError
 
 _GRAPH = EntityGraph(
     tables=[
@@ -136,6 +136,20 @@ def test_row_cap_not_triggered_when_result_fits() -> None:
     sample_db.load(database_id, {"widgets": [{"id": 1, "name": "x", "price": 1}]})
     result = sample_db.query(database_id, "SELECT id FROM widgets", row_cap=10)
     assert result.truncated is False
+
+
+def test_catalog_access_denied_by_default_against_a_real_sample_database() -> None:
+    database_id = sample_db.create(_DDL)
+    with pytest.raises(CatalogAccessDeniedError):
+        sample_db.query(database_id, "SELECT sql FROM sqlite_master")
+
+
+def test_catalog_access_permitted_with_explicit_opt_in_against_a_real_sample_database() -> None:
+    database_id = sample_db.create(_DDL)
+    result = sample_db.query(
+        database_id, "SELECT name FROM sqlite_master WHERE type = 'table'", allow_catalog=True
+    )
+    assert "widgets" in {row[0] for row in result.rows}
 
 
 def test_load_validates_identifiers_against_injection() -> None:

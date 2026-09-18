@@ -162,6 +162,7 @@ def query(
     dialect: str = "sqlite",
     timeout_seconds: float = DEFAULT_QUERY_TIMEOUT_SECONDS,
     row_cap: int = DEFAULT_ROW_CAP,
+    allow_catalog: bool = False,
 ) -> QueryResult:
     """Run a read-only query against a sample database, under D9's guarantees.
 
@@ -170,8 +171,16 @@ def query(
     than `timeout_seconds` of wall-clock time, and truncates (rather than
     erroring on) result sets larger than `row_cap`, reporting
     `QueryResult.truncated`.
+
+    D12: references to `sqlite_master`/`sqlite_schema` raise
+    `foundation.security.CatalogAccessDeniedError` (a subclass of
+    `UnsafeQueryError`) unless `allow_catalog=True` is passed explicitly.
+    Catalog enumeration against a persisted, potentially shared sample
+    database is reconnaissance, not a question the user's own schema
+    answers -- "what tables exist" has a deterministic answer via the CRUD
+    endpoints instead.
     """
-    security.assert_safe_select(sql, dialect)
+    security.assert_safe_select(sql, dialect, allow_catalog=allow_catalog)
     path = _existing_path(database_id)
 
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
