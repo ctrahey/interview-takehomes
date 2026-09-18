@@ -1,0 +1,197 @@
+{
+  "schema_version": 1,
+  "tables": [
+    {
+      "name": "users",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "email",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "password_digest",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [],
+      "checks": [],
+      "unique_constraints": [
+        {
+          "columns": [
+            "email"
+          ],
+          "name": null
+        }
+      ],
+      "comment": null
+    },
+    {
+      "name": "albums",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "user_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "name",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [
+        {
+          "columns": [
+            "user_id"
+          ],
+          "ref_table": "users",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        }
+      ],
+      "checks": [],
+      "unique_constraints": [],
+      "comment": null
+    },
+    {
+      "name": "photos",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "album_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "filename",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [
+        {
+          "columns": [
+            "album_id"
+          ],
+          "ref_table": "albums",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        }
+      ],
+      "checks": [],
+      "unique_constraints": [],
+      "comment": null
+    }
+  ]
+}

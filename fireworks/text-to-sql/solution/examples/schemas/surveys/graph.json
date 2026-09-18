@@ -1,0 +1,353 @@
+{
+  "schema_version": 1,
+  "tables": [
+    {
+      "name": "users",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "email",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "password_digest",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [],
+      "checks": [],
+      "unique_constraints": [
+        {
+          "columns": [
+            "email"
+          ],
+          "name": null
+        }
+      ],
+      "comment": null
+    },
+    {
+      "name": "surveys",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "author_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "title",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [
+        {
+          "columns": [
+            "author_id"
+          ],
+          "ref_table": "users",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        }
+      ],
+      "checks": [],
+      "unique_constraints": [],
+      "comment": null
+    },
+    {
+      "name": "survey_choices",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "survey_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "description",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [
+        {
+          "columns": [
+            "survey_id"
+          ],
+          "ref_table": "surveys",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        }
+      ],
+      "checks": [],
+      "unique_constraints": [],
+      "comment": null
+    },
+    {
+      "name": "survey_responses",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "survey_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "respondent_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [
+        {
+          "columns": [
+            "survey_id"
+          ],
+          "ref_table": "surveys",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        },
+        {
+          "columns": [
+            "respondent_id"
+          ],
+          "ref_table": "users",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        }
+      ],
+      "checks": [],
+      "unique_constraints": [
+        {
+          "columns": [
+            "survey_id",
+            "respondent_id"
+          ],
+          "name": null
+        }
+      ],
+      "comment": null
+    },
+    {
+      "name": "survey_response_choices",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "survey_choice_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "survey_response_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [
+        {
+          "columns": [
+            "survey_choice_id"
+          ],
+          "ref_table": "survey_choices",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        },
+        {
+          "columns": [
+            "survey_response_id"
+          ],
+          "ref_table": "survey_responses",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        }
+      ],
+      "checks": [],
+      "unique_constraints": [
+        {
+          "columns": [
+            "survey_choice_id",
+            "survey_response_id"
+          ],
+          "name": null
+        }
+      ],
+      "comment": null
+    }
+  ]
+}

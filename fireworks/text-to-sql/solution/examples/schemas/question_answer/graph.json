@@ -1,0 +1,366 @@
+{
+  "schema_version": 1,
+  "tables": [
+    {
+      "name": "users",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "email",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "username",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "password_digest",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [],
+      "checks": [],
+      "unique_constraints": [
+        {
+          "columns": [
+            "email"
+          ],
+          "name": null
+        },
+        {
+          "columns": [
+            "username"
+          ],
+          "name": null
+        }
+      ],
+      "comment": null
+    },
+    {
+      "name": "questions",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "author_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "best_answer_id",
+          "type": "INT",
+          "nullable": true,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "title",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "body",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [
+        {
+          "columns": [
+            "author_id"
+          ],
+          "ref_table": "users",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        },
+        {
+          "columns": [
+            "best_answer_id"
+          ],
+          "ref_table": "answers",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        }
+      ],
+      "checks": [],
+      "unique_constraints": [],
+      "comment": null
+    },
+    {
+      "name": "answers",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "author_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "question_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "body",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [
+        {
+          "columns": [
+            "author_id"
+          ],
+          "ref_table": "users",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        },
+        {
+          "columns": [
+            "question_id"
+          ],
+          "ref_table": "questions",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        }
+      ],
+      "checks": [],
+      "unique_constraints": [
+        {
+          "columns": [
+            "author_id",
+            "question_id"
+          ],
+          "name": null
+        }
+      ],
+      "comment": null
+    },
+    {
+      "name": "answer_votes",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "answer_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "voter_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "score",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [
+        {
+          "columns": [
+            "answer_id"
+          ],
+          "ref_table": "answers",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        },
+        {
+          "columns": [
+            "voter_id"
+          ],
+          "ref_table": "users",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        }
+      ],
+      "checks": [
+        {
+          "expression": "score IN (-1, 1)",
+          "name": null
+        }
+      ],
+      "unique_constraints": [
+        {
+          "columns": [
+            "answer_id",
+            "voter_id"
+          ],
+          "name": null
+        }
+      ],
+      "comment": null
+    }
+  ]
+}

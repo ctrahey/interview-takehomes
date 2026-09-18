@@ -1,0 +1,449 @@
+{
+  "schema_version": 1,
+  "tables": [
+    {
+      "name": "users",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "email",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "username",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "password_digest",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [],
+      "checks": [],
+      "unique_constraints": [
+        {
+          "columns": [
+            "username"
+          ],
+          "name": null
+        },
+        {
+          "columns": [
+            "email"
+          ],
+          "name": null
+        }
+      ],
+      "comment": null
+    },
+    {
+      "name": "submissions",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "author_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "url",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [
+        {
+          "columns": [
+            "author_id"
+          ],
+          "ref_table": "users",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        }
+      ],
+      "checks": [],
+      "unique_constraints": [],
+      "comment": null
+    },
+    {
+      "name": "submission_votes",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "submission_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "voter_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "score",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [
+        {
+          "columns": [
+            "submission_id"
+          ],
+          "ref_table": "submissions",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        },
+        {
+          "columns": [
+            "voter_id"
+          ],
+          "ref_table": "users",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        }
+      ],
+      "checks": [
+        {
+          "expression": "SCORE IN (-1, 1)",
+          "name": null
+        }
+      ],
+      "unique_constraints": [
+        {
+          "columns": [
+            "submission_id",
+            "voter_id"
+          ],
+          "name": null
+        }
+      ],
+      "comment": null
+    },
+    {
+      "name": "comments",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "author_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "submission_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "parent_id",
+          "type": "INT",
+          "nullable": true,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "body",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [
+        {
+          "columns": [
+            "author_id"
+          ],
+          "ref_table": "users",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        },
+        {
+          "columns": [
+            "submission_id"
+          ],
+          "ref_table": "submissions",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        },
+        {
+          "columns": [
+            "parent_id"
+          ],
+          "ref_table": "comments",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        }
+      ],
+      "checks": [],
+      "unique_constraints": [],
+      "comment": null
+    },
+    {
+      "name": "comment_votes",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "comment_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "voter_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "score",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [
+        {
+          "columns": [
+            "comment_id"
+          ],
+          "ref_table": "comments",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        },
+        {
+          "columns": [
+            "voter_id"
+          ],
+          "ref_table": "users",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        }
+      ],
+      "checks": [
+        {
+          "expression": "score IN (-1, 1)",
+          "name": null
+        }
+      ],
+      "unique_constraints": [
+        {
+          "columns": [
+            "comment_id",
+            "voter_id"
+          ],
+          "name": null
+        }
+      ],
+      "comment": null
+    }
+  ]
+}

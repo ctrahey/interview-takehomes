@@ -1,0 +1,277 @@
+{
+  "schema_version": 1,
+  "tables": [
+    {
+      "name": "users",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "email",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "password_digest",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [],
+      "checks": [],
+      "unique_constraints": [
+        {
+          "columns": [
+            "email"
+          ],
+          "name": null
+        }
+      ],
+      "comment": null
+    },
+    {
+      "name": "articles",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "author_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "title",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "body",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [
+        {
+          "columns": [
+            "author_id"
+          ],
+          "ref_table": "users",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        }
+      ],
+      "checks": [],
+      "unique_constraints": [],
+      "comment": null
+    },
+    {
+      "name": "tags",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "name",
+          "type": "TEXT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [],
+      "checks": [],
+      "unique_constraints": [
+        {
+          "columns": [
+            "name"
+          ],
+          "name": null
+        }
+      ],
+      "comment": null
+    },
+    {
+      "name": "taggings",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "article_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "tag_id",
+          "type": "INT",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "unique": false,
+          "default": null,
+          "comment": null
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "primary_key_name": null,
+      "foreign_keys": [
+        {
+          "columns": [
+            "article_id"
+          ],
+          "ref_table": "articles",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        },
+        {
+          "columns": [
+            "tag_id"
+          ],
+          "ref_table": "tags",
+          "ref_columns": [
+            "id"
+          ],
+          "name": null,
+          "on_delete": null,
+          "on_update": null
+        }
+      ],
+      "checks": [],
+      "unique_constraints": [
+        {
+          "columns": [
+            "article_id",
+            "tag_id"
+          ],
+          "name": null
+        }
+      ],
+      "comment": null
+    }
+  ]
+}

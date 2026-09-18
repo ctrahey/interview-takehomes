@@ -7,12 +7,51 @@ directly from the graph and asking sqlglot's generator for the dialect's SQL
 text -- there is no string templating anywhere in this module.
 
 ``parse_ddl(ddl, dialect)`` is the inverse: DDL text in, `EntityGraph` out.
-It is intentionally partial. Only ``CREATE TABLE`` statements contribute to
-the resulting graph; every other statement (``CREATE INDEX``, ``CREATE VIEW``,
-``ALTER TABLE``, ``COMMENT ON``, ...) is reported as a `ParseResult.warning`
-and skipped, never silently dropped. Within a `CREATE TABLE`, constructs the
-graph has no field for are *also* reported as warnings rather than causing a
-hard failure or vanishing quietly. See "Known inversion limits" below.
+It is intentionally partial. ``CREATE TABLE`` statements contribute to the
+resulting graph directly. ``ALTER TABLE ... ADD [CONSTRAINT ...] UNIQUE (...)``
+and ``ALTER TABLE ... ADD [CONSTRAINT ...] FOREIGN KEY (...) REFERENCES ...``
+are folded into the *same* graph table as if the constraint had been declared
+inline in the `CREATE TABLE` body (see "ALTER-expressed constraints" below) --
+this is what lets a Postgres schema that leans on ``ALTER TABLE`` (common for
+constraints added after the fact, or for a pair of tables with a circular FK)
+still arrive as one dialect-neutral graph. Every other statement
+(``CREATE INDEX``, ``CREATE VIEW``, unsupported ``ALTER TABLE`` actions,
+``COMMENT ON``, ...) is reported as a `ParseResult.warning` and skipped, never
+silently dropped. Within a `CREATE TABLE`, constructs the graph has no field
+for are *also* reported as warnings rather than causing a hard failure or
+vanishing quietly. See "Known inversion limits" below.
+
+## ALTER-expressed constraints (D6)
+
+The graph does not care whether a `UNIQUE` or `FOREIGN KEY` constraint arrived
+via a `CREATE TABLE` column/table-level clause or a later `ALTER TABLE ... ADD
+...` statement -- both become the same `UniqueConstraint` / `ForeignKey` graph
+entry on the target table. Concretely, `parse_ddl` makes two passes over the
+parsed statement list:
+
+1. Every `CREATE TABLE` is parsed into a `_TableAccumulator` (kept, not
+   discarded, so it can still be mutated in pass 2), in declaration order.
+2. Every `ALTER TABLE ... ADD CONSTRAINT? (UNIQUE (...) | FOREIGN KEY (...)
+   REFERENCES ...)` is folded into the accumulator for its target table via
+   the *same* `add_unique` / `add_foreign_key` methods pass 1 uses for inline
+   constraints -- one code path, two syntactic origins. This is also where
+   deduplication happens: a constraint that is structurally identical
+   (same columns, same reference) to one already recorded for that table is
+   silently folded rather than appended twice, so a source file that declares
+   the same `ALTER TABLE ... ADD UNIQUE (a, b)` twice (legal, if redundant,
+   PostgreSQL) does not produce two identical `UniqueConstraint` entries or
+   fail to render as SQLite (which rejects a duplicate index outright). Only
+   the two `ADD ... UNIQUE` / `ADD ... FOREIGN KEY` action shapes are folded
+   this way; any other `ALTER TABLE` action (`ADD COLUMN`, `DROP ...`,
+   `RENAME ...`, an unsupported constraint shape, or an `ALTER TABLE`
+   targeting a table this parse never saw a `CREATE TABLE` for) is reported as
+   a warning and skipped -- never silently dropped, never a hard failure.
+
+Because pass 2 runs after *all* of pass 1, this also resolves a genuinely
+circular pair of foreign keys expressed across two `ALTER TABLE` statements
+(table A's FK to B, and B's FK to A) -- by the time either `ALTER TABLE` is
+applied, both tables already exist as accumulators, so which one was
+declared/altered "first" in the source text is irrelevant.
 
 Dialect support: SQLite (D5's execution target) and Postgres (D5's
 generation-only target). Both directions raise `ValueError` for any other
@@ -234,25 +273,87 @@ class ParseResult:
 def parse_ddl(ddl: str, dialect: str) -> ParseResult:
     """Parse DDL text into a dialect-neutral entity graph. The partial inverse of `render_ddl`.
 
+    Two passes (see the module docstring's "ALTER-expressed constraints"
+    section): every `CREATE TABLE` first, then every `ALTER TABLE ... ADD
+    UNIQUE|FOREIGN KEY` folded into the table it targets. This order is what
+    lets a circular pair of FKs expressed as two separate `ALTER TABLE`
+    statements resolve regardless of declaration order.
+
     See the module docstring's "Known inversion limits" section for exactly
     what does and does not survive.
     """
     _check_dialect(dialect)
 
     warnings: list[str] = []
-    tables: list[Table] = []
+    accumulators: dict[str, _TableAccumulator] = {}
+    order: list[str] = []
+    deferred_alters: list[exp.Alter] = []
+
     for stmt in sqlglot.parse(ddl, read=dialect):
         if stmt is None:
             continue
-        if not (isinstance(stmt, exp.Create) and str(stmt.args.get("kind", "")).upper() == "TABLE"):
+        if isinstance(stmt, exp.Create) and str(stmt.args.get("kind", "")).upper() == "TABLE":
+            acc, table_warnings = _parse_table(stmt, dialect)
+            if acc.table_name in accumulators:
+                warnings.append(f"duplicate CREATE TABLE for {acc.table_name!r}; keeping the last")
+            else:
+                order.append(acc.table_name)
+            accumulators[acc.table_name] = acc
+            warnings.extend(table_warnings)
+        elif isinstance(stmt, exp.Alter) and str(stmt.args.get("kind", "")).upper() == "TABLE":
+            deferred_alters.append(stmt)
+        else:
             snippet = stmt.sql(dialect=dialect)[:80]
             warnings.append(f"skipped non-CREATE-TABLE statement: {snippet}")
-            continue
-        table, table_warnings = _parse_table(stmt, dialect)
-        tables.append(table)
-        warnings.extend(table_warnings)
 
+    for alter_stmt in deferred_alters:
+        warnings.extend(_apply_alter_table(alter_stmt, accumulators))
+
+    tables = [accumulators[name].to_table() for name in order]
     return ParseResult(graph=EntityGraph(tables=tables), warnings=warnings)
+
+
+def _apply_alter_table(stmt: exp.Alter, accumulators: dict[str, _TableAccumulator]) -> list[str]:
+    """Fold one `ALTER TABLE`'s `ADD UNIQUE` / `ADD FOREIGN KEY` actions into its table.
+
+    Any other action (`ADD COLUMN`, `DROP ...`, an unrecognized constraint
+    shape, or a target table this parse never saw a `CREATE TABLE` for) is
+    reported as a warning and skipped -- see the module docstring.
+    """
+    warnings: list[str] = []
+    table_name = stmt.this.name if isinstance(stmt.this, exp.Expression) else None
+    acc = accumulators.get(table_name) if table_name else None
+    if acc is None:
+        snippet = stmt.sql()[:80]
+        warnings.append(f"ALTER TABLE targets unknown table {table_name!r}: {snippet}")
+        return warnings
+
+    for action in stmt.args.get("actions") or []:
+        if not isinstance(action, exp.AddConstraint):
+            warnings.append(
+                f"unsupported ALTER TABLE action on {table_name!r}: {type(action).__name__}"
+            )
+            continue
+        for node in action.expressions:
+            name: str | None = None
+            inner: exp.Expression = node
+            if isinstance(node, exp.Constraint):
+                name = node.this.name if node.this else None
+                inner = node.expressions[0] if node.expressions else node
+            if isinstance(inner, exp.UniqueColumnConstraint):
+                before = len(acc.warnings)
+                acc.add_unique(inner, name)
+                warnings.extend(acc.warnings[before:])
+            elif isinstance(inner, exp.ForeignKey):
+                before = len(acc.warnings)
+                acc.add_foreign_key(inner, name)
+                warnings.extend(acc.warnings[before:])
+            else:
+                warnings.append(
+                    f"unsupported ALTER TABLE ADD CONSTRAINT shape on {table_name!r}: "
+                    f"{type(inner).__name__}"
+                )
+    return warnings
 
 
 def _identifiers(nodes: list[exp.Expression]) -> list[str]:
@@ -292,6 +393,12 @@ class _TableAccumulator:
             return
         fk = _parse_reference(reference, _identifiers(inner.expressions))
         fk.name = name
+        key = (tuple(fk.columns), fk.ref_table, tuple(fk.ref_columns))
+        if any((tuple(e.columns), e.ref_table, tuple(e.ref_columns)) == key for e in self.foreign_keys):
+            # Structurally identical to one already recorded (e.g. a source
+            # file that repeats the same `ALTER TABLE ... ADD FOREIGN KEY`) --
+            # fold silently rather than duplicate the constraint in the graph.
+            return
         self.foreign_keys.append(fk)
 
     def add_check(self, inner: exp.Check | exp.CheckColumnConstraint, name: str | None) -> None:
@@ -299,10 +406,18 @@ class _TableAccumulator:
 
     def add_unique(self, inner: exp.UniqueColumnConstraint, name: str | None) -> None:
         cols = _identifiers(inner.this.expressions) if inner.this is not None else []
-        if cols:
-            self.uniques.append(UniqueConstraint(columns=cols, name=name))
-        else:
+        if not cols:
             self.warnings.append(f"unhandled UNIQUE constraint shape on table {self.table_name!r}")
+            return
+        key = (tuple(cols), name)
+        if any((tuple(u.columns), u.name) == key for u in self.uniques):
+            # Structurally identical to one already recorded (e.g.
+            # tic_tac_toe's upstream `ALTER TABLE turns ADD UNIQUE (game_id,
+            # position)` appearing twice) -- fold silently. SQLite raises on
+            # a genuinely duplicate index; the graph should not reproduce
+            # the duplication just because the source text had it.
+            return
+        self.uniques.append(UniqueConstraint(columns=cols, name=name))
 
     def add_unsupported(self, inner: exp.Expression) -> None:
         self.warnings.append(
@@ -335,7 +450,7 @@ class _TableAccumulator:
         )
 
 
-def _parse_table(stmt: exp.Create, dialect: str) -> tuple[Table, list[str]]:
+def _parse_table(stmt: exp.Create, dialect: str) -> tuple[_TableAccumulator, list[str]]:
     schema_node = stmt.this
     if isinstance(schema_node, exp.Schema):
         table_name = schema_node.this.name
@@ -358,8 +473,7 @@ def _parse_table(stmt: exp.Create, dialect: str) -> tuple[Table, list[str]]:
             inner = node.expressions[0] if node.expressions else node
         acc.dispatch(inner, name)
 
-    table = acc.to_table()
-    return table, acc.warnings
+    return acc, acc.warnings
 
 
 def _parse_reference(ref: exp.Reference, fk_columns: list[str]) -> ForeignKey:
@@ -432,9 +546,13 @@ def _parse_column(
                 f"column {table_name!r}.{col_name!r}: unrecognized constraint {kind_name}"
             )
 
+    col_type, serial_warning = _resolve_column_type(node.kind, table_name, col_name)
+    if serial_warning:
+        warnings.append(serial_warning)
+
     col = Column(
         name=col_name,
-        type=_type_to_str(node.kind),
+        type=col_type,
         nullable=nullable,
         unique=unique,
         default=default,
@@ -446,3 +564,32 @@ def _type_to_str(dt: exp.DataType) -> str:
     type_name = dt.this.value if hasattr(dt.this, "value") else str(dt.this)
     params = [e.sql() for e in dt.expressions]
     return f"{type_name}({', '.join(params)})" if params else type_name
+
+
+# Postgres's SERIAL family is sugar for "INTEGER (or SMALLINT/BIGINT) column
+# backed by a sequence, with DEFAULT nextval(...)" -- not a real data type in
+# sqlglot's canonical vocabulary (`Column.type` validation rejects it, see
+# `_validate_sql_type` in `foundation.graph`), and the identity/autoincrement
+# behavior it implies is in the same "not modeled" bucket as
+# `_UNMODELED_INLINE_CONSTRAINTS` above. Captured as the plain integer type;
+# for the common case (a lone `id SERIAL PRIMARY KEY`), `render_ddl` already
+# renders a solo unnamed PK as SQLite's `INTEGER PRIMARY KEY`, which SQLite
+# treats as a rowid alias and auto-assigns on insert -- so the practical
+# behavior survives even though the graph has no explicit "is identity" field.
+_SERIAL_TYPES = {
+    exp.DataType.Type.SERIAL: "INT",
+    exp.DataType.Type.SMALLSERIAL: "SMALLINT",
+    exp.DataType.Type.BIGSERIAL: "BIGINT",
+}
+
+
+def _resolve_column_type(dt: exp.DataType, table_name: str, col_name: str) -> tuple[str, str | None]:
+    serial_type = _SERIAL_TYPES.get(dt.this)
+    if serial_type is None:
+        return _type_to_str(dt), None
+    warning = (
+        f"column {table_name!r}.{col_name!r}: Postgres {dt.this.value} is an "
+        f"identity/autoincrement pseudo-type, not modeled -- captured as {serial_type!r}; "
+        "the sequence/autoincrement behavior itself is dropped"
+    )
+    return serial_type, warning

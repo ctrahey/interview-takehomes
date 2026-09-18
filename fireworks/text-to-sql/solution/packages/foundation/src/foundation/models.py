@@ -275,3 +275,74 @@ class Query(Base):
     session: Mapped[Session] = relationship(back_populates="queries")
     schema: Mapped[Schema | None] = relationship(back_populates="queries")
     database: Mapped[Database | None] = relationship(back_populates="queries")
+
+
+class SessionState(Base):
+    """The durable "where am I?" pointers for one conversation (layer 3, W10).
+
+    The natural-language orchestrator resolves pronouns -- "load *it* with
+    data", "run *that*", "show me some rows" -- against these pointers. They
+    live here, in foundation, and not in the chat client's process memory,
+    because MAIN.md's whole point about Session is that the scope is *durable*:
+    reopening a conversation must resume it with its current model, schema and
+    database intact.
+
+    One row per session, keyed by (and FK to) `sessions.id`. Kept as its own
+    table rather than as columns on `sessions` so that `last_query_id` can be a
+    real foreign key: `queries.session_id` already points at `sessions`, so the
+    reverse pointer on `sessions` itself would be a table-level cycle.
+    """
+
+    __tablename__ = "session_states"
+
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("sessions.id"), primary_key=True
+    )
+    current_data_model_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("data_models.id"), nullable=True
+    )
+    current_data_model_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("data_model_versions.id"), nullable=True
+    )
+    current_schema_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("schemas.id"), nullable=True
+    )
+    current_database_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("databases.id"), nullable=True
+    )
+    last_query_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("queries.id"), nullable=True
+    )
+    last_question: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = _updated_at()
+
+    session: Mapped[Session] = relationship()
+
+
+class Corrective(Base):
+    """A durable domain fact the user supplied in conversation (D13).
+
+    "revenue_cents is cents"; "cancelled orders are status='C' and are usually
+    excluded". Scoped to a `DataModel` -- *not* to a session and *not* to an
+    inference model -- because that is the thing the knowledge is about, and it
+    must outlive both the conversation and our choice of LLM (D13's two-bucket
+    split). Model correctives, which belong to an (inference_model, dialect)
+    pair, are deliberately NOT stored here; they are prompt-registry material.
+    """
+
+    __tablename__ = "correctives"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    data_model_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("data_models.id"), nullable=False, index=True
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("sessions.id"), nullable=True, index=True
+    )
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = _created_at()
+
+    data_model: Mapped[DataModel] = relationship()
+
+    __table_args__ = (Index("ix_correctives_model_active", "data_model_id", "active"),)

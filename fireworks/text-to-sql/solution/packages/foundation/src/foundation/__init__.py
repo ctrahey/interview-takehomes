@@ -15,6 +15,9 @@ Submodules:
 - `foundation.repositories` -- thin typed data-access layer.
 - `foundation.paths` / `foundation.security` / `foundation.sample_db` --
   the sample database lifecycle and its D9 security guarantees.
+- `foundation.examples` -- the out-of-the-box example schema library (W11):
+  `list_examples()` / `load_example(name)` over the 8 schemas vendored under
+  ``examples/`` at the repo root.
 """
 
 __all__: list[str] = []

@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session as OrmSession
 from foundation.bootstrap import get_or_create_default_project, get_or_create_default_session
 from foundation.graph import EntityGraph
 from foundation.models import (
+    Corrective,
     Database,
     DatabaseStatus,
     DataModel,
@@ -31,6 +32,7 @@ from foundation.models import (
     Project,
     Query,
     Schema,
+    SessionState,
 )
 from foundation.models import Session as SessionModel
 
@@ -276,3 +278,100 @@ class QueryRepository:
     def list_for_session(self, session_id: uuid.UUID) -> list[Query]:
         stmt = select(Query).where(Query.session_id == session_id).order_by(Query.created_at)
         return list(self.db.execute(stmt).scalars())
+
+
+class SessionStateRepository:
+    """The durable "current" pointers for a conversation (`models.SessionState`).
+
+    Used by the layer-3 orchestrator so pronouns resolve across process
+    restarts: "load it with data" means the current schema, "run that" means
+    the last query. Nothing here interprets natural language -- it stores and
+    returns ids.
+    """
+
+    def __init__(self, db: OrmSession) -> None:
+        self.db = db
+
+    def get_or_create(self, session_id: uuid.UUID) -> SessionState:
+        existing = self.db.get(SessionState, session_id)
+        if existing is not None:
+            return existing
+        if self.db.get(SessionModel, session_id) is None:
+            raise ValueError(f"no session with id {session_id}")
+        row = SessionState(session_id=session_id)
+        self.db.add(row)
+        self.db.flush()
+        return row
+
+    def set(self, session_id: uuid.UUID, **pointers: uuid.UUID | str | None) -> SessionState:
+        """Set one or more pointers. Only the keys passed are touched.
+
+        Passing an explicit ``None`` clears that pointer; omitting the key
+        leaves it alone. That distinction matters -- "I destroyed the database"
+        has to be expressible without also clearing the current schema.
+        """
+        row = self.get_or_create(session_id)
+        allowed = {
+            "current_data_model_id",
+            "current_data_model_version_id",
+            "current_schema_id",
+            "current_database_id",
+            "last_query_id",
+            "last_question",
+        }
+        unknown = set(pointers) - allowed
+        if unknown:
+            raise ValueError(f"unknown session state pointer(s): {sorted(unknown)}")
+        for key, value in pointers.items():
+            setattr(row, key, value)
+        self.db.flush()
+        return row
+
+
+class CorrectiveRepository:
+    """Domain correctives, scoped to a `DataModel` (D13)."""
+
+    #: A corrective is reference data in a *system* prompt, which is the most
+    #: privileged position in the request. Bound both the number carried and
+    #: the length of each one, so a single conversation cannot grow the system
+    #: prompt without limit.
+    MAX_TEXT_LENGTH = 400
+
+    def __init__(self, db: OrmSession) -> None:
+        self.db = db
+
+    def add(
+        self,
+        data_model_id: uuid.UUID,
+        text: str,
+        *,
+        session_id: uuid.UUID | None = None,
+    ) -> Corrective:
+        cleaned = " ".join(text.split())
+        if not cleaned:
+            raise ValueError("a corrective cannot be empty")
+        if len(cleaned) > self.MAX_TEXT_LENGTH:
+            raise ValueError(
+                f"corrective is {len(cleaned)} characters; the limit is {self.MAX_TEXT_LENGTH}"
+            )
+        if self.db.get(DataModel, data_model_id) is None:
+            raise ValueError(f"no data model with id {data_model_id}")
+        row = Corrective(data_model_id=data_model_id, session_id=session_id, text=cleaned)
+        self.db.add(row)
+        self.db.flush()
+        return row
+
+    def list_active(self, data_model_id: uuid.UUID) -> list[Corrective]:
+        stmt = (
+            select(Corrective)
+            .where(Corrective.data_model_id == data_model_id, Corrective.active.is_(True))
+            .order_by(Corrective.created_at)
+        )
+        return list(self.db.execute(stmt).scalars())
+
+    def deactivate(self, corrective_id: uuid.UUID) -> None:
+        row = self.db.get(Corrective, corrective_id)
+        if row is None:
+            raise ValueError(f"no corrective with id {corrective_id}")
+        row.active = False
+        self.db.flush()
