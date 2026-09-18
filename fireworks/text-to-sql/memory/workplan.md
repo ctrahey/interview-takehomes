@@ -79,3 +79,17 @@ Never cut: W1, W2's adversarial items, W4, or W8. Those four *are* the submissio
 
 ## Live-API budget
 Only W4's real run and W1's fixture capture hit Fireworks. Capture fixtures once, replay everywhere.
+
+## W9 — Domain correctives (added 2026-09-18, per D13)
+Dispatch AFTER W5 and W7 land — all three touch the request path and would collide.
+
+Scope: `QueryRequest.correctives: list[str] | None`; a new prompt template version with a delimited
+correctives section carrying the DATA-not-instructions framing; count and per-item length caps;
+echo in result metadata; API and CLI pass-through; adversarial test for a corrective-borne injection
+attempt; and an eval arm measuring accuracy with vs. without correctives on domain-knowledge items.
+
+Done when: the corrective delta is a measured number in the report, and an injection attempt
+delivered *via a corrective* is proven not to escape the delimited section.
+
+Degrades gracefully: if only the stateless field + prompt injection point land and the eval arm does
+not, the capability still demos in the CLI and the design intent is documented.

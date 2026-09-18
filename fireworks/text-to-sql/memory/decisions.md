@@ -83,3 +83,95 @@ schema response format. Record the chosen ID and the date in `memory/status.md`.
 ## Open item (needs Chris)
 - Fireworks API key: is one provisioned, and is there a spend ceiling for eval runs?
   Everything except the live eval run proceeds without it.
+
+---
+
+## D11 — The eval runs multiple model arms, because the repair loop's value is model-dependent
+W1 finding #6: eight engineered binder traps failed to make `kimi-k2p7-code` emit bind-failing SQL.
+It either wrote correct dialect-aware SQL or abstained. So the loop-off vs loop-on delta on the
+primary model may be near zero.
+
+That is a **result**, not a setback, and we report it as one. But a single-arm eval would leave the
+repair loop looking like unjustified machinery, so W4 runs the corpus across:
+- `kimi-k2p7-code` (primary) — loop off, loop on
+- a deliberately weaker model — loop off, loop on
+
+Candidates for the weak arm, in preference order: `muse-glimmer-30b`,
+`nemotron-lightning-3p5-30b-a3b`, `glm-5p3-flash` (known to leak chain-of-thought into `prose`, so
+it also exercises the envelope-invariant repair path). Pick by a 5-item smoke test, not by name.
+
+The claim this supports is stronger than the one we originally planned:
+**scaffolding value scales inversely with model strength.** On a frontier code model the loop is
+cheap insurance; on a cheaper model it is what makes the cheaper model usable. That is a real
+engineering finding about where to spend inference budget, and it is only visible because the eval
+has more than one arm.
+
+~53 items × 2 arms × 2 models ≈ 210 calls. Cost is negligible; wall-clock is the only constraint.
+
+## D12 — The sample-database path denies catalog access by default
+W1 finding #8: "what columns does table X have?" is answered with `SELECT sql FROM sqlite_master`,
+which is a legitimate single read-only SELECT and passes the D9 gate on its merits.
+
+- In `t2s_core` this is **correct and stays allowed** — the request's own DDL is the entire world
+  there, and the ephemeral DB is a throwaway built from that same DDL.
+- In `foundation`'s sample-database execution path it is **denied by default**: add
+  `sqlite_master` / `sqlite_schema` to a table denylist, with an explicit `allow_catalog: bool =
+  False` parameter to opt in. Catalog enumeration against a persisted, potentially shared database
+  is reconnaissance, and "the user owns this database" is an assumption that stops holding the
+  moment anything is multi-tenant.
+
+Document the opt-in rather than hiding the denial — a user asking "what tables exist?" should get a
+clear refusal pointing at the CRUD endpoints that answer it deterministically, not a confusing
+empty result.
+
+## D13 — Correctives: stateless input now, lifecycle later
+Proposed by Chris 2026-09-18. Accepted, scoped.
+
+**Why it is not feature creep.** The repair loop (D4) catches only mechanical failure — unparseable
+JSON, envelope invariant violations, safety-gate rejections, binder errors. W1 finding #6 showed
+`kimi-k2p7-code` essentially never fails that way. The residual failure mode is *semantic*: SQL that
+parses, binds, executes, returns rows, and answers the wrong question. No amount of model capability
+fixes this, because the missing information is not in the DDL — that `revenue_cents` is cents, that
+`status='C'` means cancelled and is usually excluded, that "revenue" is net of refunds. Correctives
+are the repair mechanism for the error class the system is currently blind to.
+
+**Two kinds. Do not conflate them.**
+
+| | Domain corrective | Model corrective |
+|---|---|---|
+| example | "revenue_cents is cents" | "this model emits `DISTINCT ON` in SQLite" |
+| scope | a `DataModel` | an `(inference_model, dialect)` pair |
+| lifetime | outlives model choice | dies on model swap |
+| owner | the user | us |
+| storage | foundation, user data | the prompt registry, as a versioned template patch |
+
+One bucket for both means you cannot switch LLMs without losing user domain knowledge, and cannot
+patch a model quirk without editing user data. Phase 1 implements **domain correctives only**;
+model correctives are named here so the split exists before anything is persisted.
+
+**Phase 1 scope (stateless half only):**
+- `QueryRequest.correctives: list[str] | None`. The stateless layer stays stateless — correctives
+  arrive in the payload; assembling them is the caller's job. This is the first feature that would
+  have tempted us to make the core stateful, and it does not have to.
+- Injected as a clearly delimited section of the system prompt, new template version.
+- Echoed in `metadata` so the eval can attribute outcomes to correctives.
+- API and CLI pass-through.
+
+**Security — correctives are a privileged injection point.** They land in the *system* prompt, which
+is where "ignore previous instructions" is most effective. Required: the same DATA-not-instructions
+framing proven in inference-findings §"Prompt injection"; a hard cap on count and per-item length;
+a delimited section the model is told is user-supplied reference material, not instruction. A
+corrective-borne injection attempt goes in the adversarial corpus.
+
+**Why it earns its place in the eval.** Unlike the repair-loop delta (predicted ≈0 on a strong
+model), the corrective delta should be large and should *stay* large as models improve, because it
+supplies knowledge no model can infer from a schema. Measure accuracy with and without correctives
+on items requiring domain knowledge.
+
+**Product loop this unlocks (demoable, ~15s in the CLI):** an ambiguous question returns
+`clarification_needed` → the user answers → the answer is recorded as a corrective → the same
+question now returns a correct query. The corpus already contains the abstention items this needs.
+
+**Deferred to phase 2:** persistence per DataModel, provenance, effectiveness tracking,
+auto-promotion of clarification answers into correctives, conflict/precedence resolution beyond a
+simple most-recent-wins ordering.
