@@ -1,0 +1,94 @@
+{
+  "purpose": "D11: pick the weak eval arm by measurement. A candidate that produces zero failures on this probe teaches nothing about the repair loop.",
+  "items": [
+    "retail-e01",
+    "retail-m01",
+    "retail-h01",
+    "adv-inj-01",
+    "retail-h02"
+  ],
+  "arm": "loop_off (NoOpValidator, max_repair_attempts=0)",
+  "results": [
+    {
+      "model": "accounts/fireworks/models/muse-glimmer-30b",
+      "correct": 1,
+      "n": 5,
+      "failures": [
+        {
+          "item": "retail-e01",
+          "tier": "easy",
+          "reason": "no_query",
+          "detail": "expected a query; response_class='error'"
+        },
+        {
+          "item": "retail-m01",
+          "tier": "medium",
+          "reason": "no_query",
+          "detail": "expected a query; response_class='error'"
+        },
+        {
+          "item": "retail-h01",
+          "tier": "hard",
+          "reason": "no_query",
+          "detail": "expected a query; response_class='error'"
+        },
+        {
+          "item": "retail-h02",
+          "tier": "hard",
+          "reason": "no_query",
+          "detail": "expected a query; response_class='error'"
+        }
+      ],
+      "wall_clock_s": 17.1,
+      "api_calls": 5
+    },
+    {
+      "model": "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b",
+      "correct": 3,
+      "n": 5,
+      "failures": [
+        {
+          "item": "retail-e01",
+          "tier": "easy",
+          "reason": "column_count_mismatch",
+          "detail": "gold returned 3 column(s) ['name', 'category', 'unit_price'], candidate returned 4 ['id', 'sku', 'name', 'discontinued_date']"
+        },
+        {
+          "item": "retail-h02",
+          "tier": "hard",
+          "reason": "value_mismatch",
+          "detail": "100 row(s) either side; e.g. gold-only [(1.0, 66.0, '2023-12-28', 1.0), (1.0, 64.0, '2023-11-27', 2.0)], candidate-only [(66.0, 1.0, '2023-12-28', 1.0), (64.0, 1.0, '2023-11-27', 2.0)]"
+        }
+      ],
+      "wall_clock_s": 12.6,
+      "api_calls": 5
+    },
+    {
+      "model": "accounts/fireworks/models/glm-5p3-flash",
+      "correct": 2,
+      "n": 5,
+      "failures": [
+        {
+          "item": "retail-e01",
+          "tier": "easy",
+          "reason": "column_count_mismatch",
+          "detail": "gold returned 3 column(s) ['name', 'category', 'unit_price'], candidate returned 5 ['id', 'sku', 'name', 'category', 'discontinued_date']"
+        },
+        {
+          "item": "retail-m01",
+          "tier": "medium",
+          "reason": "order_mismatch",
+          "detail": "same 32 row(s), different order; gold has a top-level ORDER BY"
+        },
+        {
+          "item": "retail-h02",
+          "tier": "hard",
+          "reason": "value_mismatch",
+          "detail": "100 row(s) either side; e.g. gold-only [(1.0, 66.0, '2023-12-28', 1.0), (1.0, 64.0, '2023-11-27', 2.0)], candidate-only [(66.0, 1.0, '2023-12-28', 1.0), (64.0, 1.0, '2023-11-27', 2.0)]"
+        }
+      ],
+      "wall_clock_s": 7.7,
+      "api_calls": 5
+    }
+  ]
+}
