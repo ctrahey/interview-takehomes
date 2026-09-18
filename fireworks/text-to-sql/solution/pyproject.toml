@@ -1,0 +1,99 @@
+[project]
+name = "t2s-workspace"
+version = "0.1.0"
+description = "Text-to-SQL take-home — uv workspace root (not itself installable)"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "import-linter>=2.0",
+    "httpx>=0.27",
+]
+
+# ---------------------------------------------------------------------------
+# ruff — lint + format
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = [
+    "packages/t2s_core/src",
+    "packages/foundation/src",
+    "packages/api/src",
+    "packages/cli/src",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "PL"]
+ignore = ["PLR0913"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["PLR2004"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ---------------------------------------------------------------------------
+# mypy — strict-ish on our own packages
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+mypy_path = [
+    "packages/t2s_core/src",
+    "packages/foundation/src",
+    "packages/api/src",
+    "packages/cli/src",
+]
+files = [
+    "packages/t2s_core/src",
+    "packages/foundation/src",
+    "packages/api/src",
+    "packages/cli/src",
+]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+no_implicit_optional = true
+strict_equality = true
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = [
+    "packages/t2s_core/tests",
+    "packages/foundation/tests",
+    "packages/api/tests",
+    "packages/cli/tests",
+    "tests",
+    "evals",
+]
+addopts = "-ra --import-mode=importlib"
+asyncio_mode = "auto"
+
+# ---------------------------------------------------------------------------
+# import-linter — the t2s_core ↛ foundation contract (D4 / design §1)
+# ---------------------------------------------------------------------------
+[tool.importlinter]
+root_packages = ["t2s_core", "foundation", "t2s_api", "t2s_cli"]
+
+[[tool.importlinter.contracts]]
+name = "t2s_core must not depend on foundation, t2s_api, or t2s_cli"
+type = "forbidden"
+source_modules = ["t2s_core"]
+forbidden_modules = ["foundation", "t2s_api", "t2s_cli"]

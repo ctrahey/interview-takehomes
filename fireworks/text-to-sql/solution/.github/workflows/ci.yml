@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# No FIREWORKS_API_KEY anywhere in this workflow: CI only runs the offline
+# suite (D8). Live evaluation is a separate, explicitly-invoked target.
+jobs:
+  offline-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.11.16"
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: setup (uv sync --all-packages)
+        working-directory: solution
+        run: make setup
+
+      - name: lint
+        working-directory: solution
+        run: make lint
+
+      - name: typecheck
+        working-directory: solution
+        run: make typecheck
+
+      - name: import-contract (t2s_core ↛ foundation / api / cli)
+        working-directory: solution
+        run: make import-contract
+
+      - name: test (offline suite)
+        working-directory: solution
+        run: make test
