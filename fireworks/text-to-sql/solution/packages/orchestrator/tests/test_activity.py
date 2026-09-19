@@ -15,10 +15,10 @@ properties that make it legible:
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 import uuid
 from datetime import UTC, datetime
-import sqlite3
 from pathlib import Path
 
 import pytest
@@ -471,7 +471,10 @@ def test_export_writes_a_standalone_file_and_logs_it(
     What it produces has to open without us -- so this reads it back with a
     bare sqlite3 connection that knows nothing about the workbench.
     """
-    monkeypatch.setenv("T2S_EXPORT_DIR", str(tmp_path))
+    # A directory of its own: `tmp_path` already holds the store's own
+    # foundation.sqlite3, and globbing *.sqlite3 over it would count that too.
+    export_dir = tmp_path / "exports"
+    monkeypatch.setenv("T2S_EXPORT_DIR", str(export_dir))
     orch = _drive(store)  # leaves a loaded sample database on the session
     # `_drive`'s scripted router queue is exhausted by the turns above and
     # repeats its last entry, so give this turn its own classification.
@@ -479,7 +482,7 @@ def test_export_writes_a_standalone_file_and_logs_it(
     turn = orch.run("save a copy of this database locally")[-1]
 
     assert turn.intent == "export"
-    written = sorted(tmp_path.glob("*.sqlite3"))
+    written = sorted(export_dir.glob("*.sqlite3"))
     assert len(written) == 1, f"expected one exported file, got {written}"
     assert str(written[0]) in turn.text
 

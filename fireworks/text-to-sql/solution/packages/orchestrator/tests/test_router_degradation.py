@@ -16,9 +16,9 @@ from nl_doubles import ScriptedClient, router_payload
 from t2s_core.errors import UpstreamError
 from t2s_core.ports import InferenceResponse
 from t2s_nl.intents import (
-    WIRE_INTENTS,
     MAX_PLAN_DIRECTIVES,
     PLAN_SCHEMA,
+    WIRE_INTENTS,
     plan_from_payload,
 )
 from t2s_nl.router import RouterContext, route

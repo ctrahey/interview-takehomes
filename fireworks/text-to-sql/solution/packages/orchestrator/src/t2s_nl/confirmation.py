@@ -44,14 +44,30 @@ def _compile(*patterns: str) -> tuple[re.Pattern[str], ...]:
 
 #: Checked FIRST, so "no, don't" beats the "do" inside it and "not yet" never
 #: reads as "yes". Refusal winning ties is the only safe precedence here.
+#:
+#: The soft cues are anchored to the *whole* utterance. "wait" on its own is a
+#: refusal; "wait - what's my current schema?" is a new request that happens to
+#: start with it, and reading the second as a refusal swallowed the question --
+#: found by driving it, not by reasoning about it.
 _NEGATIVE: Final = _compile(
     r"^\s*(no|nope|nah|n)\b",
     r"\b(don'?t|do not)\b",
     r"\b(cancel|abort|stop|forget it|never ?mind|nevermind|leave it|hold off)\b",
-    r"\b(not yet|not now|wait)\b",
+    # "not yet" / "not now" are refusals wherever they appear -- "yes but not
+    # now" has to land on no. Only the bare-interjection cues are anchored to
+    # the whole utterance, because those are the ones that also open sentences
+    # that are not refusals at all.
+    r"\b(not yet|not now|maybe later|some other time)\b",
+    r"^\s*(wait|hold on|hang on)\s*[.!]*\s*$",
     r"\bchanged my mind\b",
     r"\bon second thought\b",
 )
+
+#: An utterance carrying a question is a question, whatever else is in it. It
+#: cannot be a yes or a no, because the user is asking rather than answering --
+#: and "unrelated" is not a dead end: it drops the pending action (announced)
+#: and routes the question normally, which is what they wanted.
+_ASKS_SOMETHING: Final = re.compile(r"\?")
 
 #: Deliberately narrow and anchored. Every one of these is a *reply* to a
 #: yes/no question rather than a fresh instruction -- see commitment 3 in the
@@ -78,6 +94,8 @@ def read(utterance: str) -> Verdict:
     """
     text = utterance.replace("’", "'").strip()
     if not text:
+        return "unrelated"
+    if _ASKS_SOMETHING.search(text):
         return "unrelated"
     if any(p.search(text) for p in _NEGATIVE):
         return "negative"

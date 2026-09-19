@@ -156,11 +156,27 @@ def test_the_destructive_pair_is_told_apart_and_the_ambiguous_one_is_not_guessed
 
 
 def test_a_back_reference_resolves_against_history_instead_of_asking_again() -> None:
-    """Defect 2. Neither utterance is answerable from the state checklist alone."""
+    """Defect 2, isolated: the same words, the same state, different histories.
+
+    Without the recent-turn block the router can only reach for the session's
+    *current* model, and it names the wrong database with full confidence. With
+    it, "the one I already mentioned" resolves to the one that was actually
+    mentioned. The two contexts differ in nothing else, so the delta is the
+    history and only the history.
+    """
     named = route(
         "delete the one I already mentioned", client=offline_client(), context=RECALL_CONTEXT
     )
     assert named.intents == ("destroy",)
+    assert "sports" in (named.primary.parameters.model_ref or "").lower()
+
+    blind = route(
+        "delete the one I already mentioned", client=offline_client(), context=LOADED_CONTEXT
+    )
+    assert "sports" not in (blind.primary.parameters.model_ref or "").lower(), (
+        "without history the router has nothing to resolve against and picks the "
+        "current model -- which is the defect"
+    )
 
     # The bare complaint stays `unknown` -- two antecedents, no verb, and asking
     # is correct. What changed is the question: with history it cites the

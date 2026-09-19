@@ -137,6 +137,18 @@ _EXECUTE = _compile(
     r"\bgo ahead and run\b",
 )
 
+#: `export` copies a file and says where it went -- no model, no generation, so
+#: it is routable here like `inspect` and `execute`. It belongs with the intent:
+#: a value in the enum the keyword router cannot reach is a value that silently
+#: stops working the moment there is no key.
+_EXPORT = _compile(
+    r"\bexport\b",
+    r"\b(save|write|give|get|hand) (me )?(a |the )?(copy|snapshot|dump|file)\b",
+    r"\b(copy|snapshot) of (the|this|that|my) (database|db|data)\b",
+    r"\b(db browser|datagrip|sqlite3 shell|my own tools?)\b",
+    r"\bas a (sqlite )?file\b",
+)
+
 _LOAD_DATA = _compile(
     r"\b(load|populate|fill|seed)\b[^.]*\b(data|rows|it|them|database|db|tables?)\b",
     r"\bsample data\b",
@@ -418,6 +430,7 @@ class _Match:
 #: I have" contains the word ``model``).
 _STAGES: Final[tuple[tuple[tuple[re.Pattern[str], ...], Callable[[str, str], _Match]], ...]] = (
     (_HELP, lambda segment, cue: _Match("help", cue)),
+    (_EXPORT, lambda segment, cue: _Match("export", cue)),
     (
         _EXECUTE,
         lambda segment, cue: _Match(
