@@ -1,0 +1,55 @@
+# Keep the build context small and keep secrets/local state out of it
+# entirely -- the Dockerfile COPYs explicit paths, but a lean context also
+# makes `docker build` faster and is one more layer against an accidental
+# `COPY . .` leaking something.
+
+# Secrets -- never send these to the daemon / into a layer.
+.env
+.env.*
+!.env.example
+**/.fireworks-key
+
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Virtualenv / uv (built fresh inside the image)
+.venv/
+**/.venv/
+uv.lock.tmp
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.import_linter_cache/
+
+# Local sample databases / foundation metadata store -- these are runtime
+# state (D9: managed directory, not repo content) and must never end up
+# baked into an image layer.
+*.db
+*.sqlite
+*.sqlite3
+sample_dbs/
+data/db/
+.t2s/
+
+# Evidence / reports / examples -- not needed to build or run the container.
+evals/reports/*.json
+evals/reports/*.md
+!evals/reports/README.md
+
+# OS cruft, editors
+.DS_Store
+.idea/
+.vscode/
+
+# Docker itself
+docker/README.md
+Dockerfile.bak

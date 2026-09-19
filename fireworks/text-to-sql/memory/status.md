@@ -48,8 +48,39 @@ local-sandbox-only and must not be baked into CI.
 | W8 evidence | last | opus |
 | W10 orchestrator (layer 3) | **done** — `t2s_nl` + `t2s-chat`; 104 tests, 38 live-captured fixtures | opus |
 | W13 activity log + directive plans (D14/D15) | **done** — `make check` green, 536 tests | opus |
+| W14 containerization | **done** — Dockerfile + docker-compose.yml, `make check` green, 544 tests | sonnet |
 
-## Integration constraints discovered during verification
+## W14 — containerization (2026-09-18)
+`Dockerfile` (multi-stage, uv-based, python:3.12-slim-bookworm, non-root, 354MB final image),
+`docker-compose.yml` (`api`, `chat`, `postgres` behind a `postgres` profile), `.dockerignore`,
+`docker/README.md`. Verified live: builds for arm64 (host) and amd64 (buildx cross-build); container
+starts and reports healthy with **no** `FIREWORKS_API_KEY` set (layer-1 CRUD confirmed over HTTP);
+with the key read from `~/.fireworks-key` into a local, gitignored `.env`, one live layer-2 call
+succeeded end-to-end through the container; `docker history`/env grep confirm no key material ever
+enters the image. No files under `packages/foundation` or `packages/orchestrator` were touched.
+
+**Postgres as the foundation metadata store (D5's "(a)") — works, config-only.** `foundation`'s ORM
+models use only portable SQLAlchemy types (`Uuid`, `JSON`, `String`, `Text`, `DateTime`); the only
+SQLite-specific code is two `if url.startswith("sqlite")` branches already in `foundation/db.py`
+(connect_args, `PRAGMA foreign_keys`). The only gap was a driver — nothing in the workspace depended
+on `psycopg`. Added via `uv pip install psycopg[binary]` in the Dockerfile, *after* the final
+`uv sync`, not via any package's `pyproject.toml`/`uv.lock` (a `uv sync --frozen` run after an
+earlier attempt silently uninstalled it again — order matters). Verified live against a
+`postgres:16-alpine` sidecar: all 12 tables created (`init_db` = `Base.metadata.create_all`), a
+project→session FK round-trip via the running API, rows confirmed with `psql` in the postgres
+container.
+
+**Postgres as an executable sample-database engine (D5's "(b)")** stays out of scope — documented at
+length in `docker/README.md` (what it would take: an engine-backend port on `foundation/sample_db.py`,
+D9's three-layer enforcement re-derived for Postgres semantics, per-database isolation without "just
+a file", and a decision on what the eval corpus means once Postgres is executable).
+
+**Discovered, not fixed (orchestrator out of scope):** `t2s_api` defers building a live
+`FireworksClient` until a layer-2 request needs one, so the API starts with no key. `t2s-chat`
+(orchestrator) does not — it fails fast at startup with no key. Both are reasonable; noted for W15+
+in case a consistent story is wanted later.
+
+
 
 **foundation's safety gate blocks `EXPLAIN`.** Correct for the user-facing query path, but
 `t2s_core`'s `EphemeralSqliteValidator` uses `EXPLAIN` for its dry-run. Therefore the dry-run MUST

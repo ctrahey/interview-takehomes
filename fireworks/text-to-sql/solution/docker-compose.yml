@@ -1,0 +1,135 @@
+# docker-compose.yml — see docker/README.md for the full guide (CORS, data
+# persistence, running with/without a key, running with/without Postgres).
+#
+# Quick start, no Fireworks key, no Postgres:
+#   docker compose up --build
+#   open http://localhost:8000/docs        # Swagger UI
+#   curl  http://localhost:8000/openapi.json
+#
+# With a key (layer 2 / text-to-sql generation):
+#   printf 'FIREWORKS_API_KEY=%s\n' "$(cat ~/.fireworks-key)" >> .env   # never source the file
+#   docker compose up --build
+#
+# Conversational CLI against the same stack (shares its volumes, so `t2s-chat`
+# sees the same sample databases and foundation metadata the API does):
+#   docker compose run --rm chat
+#
+# Postgres as the FOUNDATION METADATA STORE (projects/sessions/models/
+# activities) -- opt-in profile, off by default:
+#   docker compose --profile postgres up -d postgres
+#   T2S_API_DB_URL=postgresql+psycopg://t2s:t2s@postgres:5432/t2s \
+#   T2S_DB_URL=postgresql+psycopg://t2s:t2s@postgres:5432/t2s \
+#     docker compose up --build api
+#
+# Postgres as an EXECUTABLE SAMPLE-DATABASE ENGINE is a *different* thing and
+# is explicitly out of scope (memory/decisions.md D5: SQLite is the only
+# engine this system executes against; Postgres is a generation target,
+# validated by sqlglot parse/transpile only, never run). This sidecar makes
+# that newly plausible to build, so the door is documented rather than
+# accidentally shut -- see docker/README.md §"Postgres as a sample-database
+# engine (not implemented)" for what it would take.
+
+services:
+  # ---------------------------------------------------------------------
+  # api — the FastAPI app (uvicorn), always built the same way as `chat`.
+  # ---------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: t2s:local
+    ports:
+      - "${T2S_API_PORT:-8000}:8000"
+    env_file:
+      # optional: a fresh clone with no .env still comes up (no key, no
+      # overrides) -- see docker/README.md.
+      - path: .env
+        required: false
+    environment:
+      # Falls back to the image's own SQLite default (see Dockerfile) when
+      # unset -- so plain `docker compose up` needs no Postgres at all.
+      T2S_API_DB_URL: ${T2S_API_DB_URL:-sqlite:////data/foundation/foundation.sqlite3}
+      T2S_SAMPLE_DB_DIR: /data/sample_dbs
+      # Container-to-host CORS: a host-run Vite/webpack dev server (default
+      # 5173/3000) is already allowed (t2s_api.app.DEFAULT_CORS_ORIGINS).
+      # Override here for any other origin.
+      T2S_CORS_ORIGINS: ${T2S_CORS_ORIGINS:-}
+    volumes:
+      # Named volume: sample database *files* (D9's managed directory) are
+      # real files a user can spend real time creating/loading -- losing
+      # them on `docker compose down`/restart would be a bad surprise.
+      - sample_dbs:/data/sample_dbs
+      # Named volume: foundation's own metadata store (projects, sessions,
+      # data models, activities, ...) when running the SQLite default. Inert
+      # once T2S_API_DB_URL points at Postgres instead.
+      - foundation_meta:/data/foundation
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/openapi.json', timeout=2)",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # chat — t2s-chat (packages/orchestrator), same image as `api`, run as a
+  # one-off: `docker compose run --rm chat`. Not part of `docker compose up`
+  # (a REPL with no attached TTY has nothing useful to do as a daemon).
+  # Shares both named volumes with `api`, so a database created in the chat
+  # session is visible to the API and vice versa.
+  # ---------------------------------------------------------------------
+  chat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: t2s:local
+    # Not started by plain `docker compose up` (a REPL with no attached TTY
+    # has nothing useful to do as a daemon) -- but `docker compose run
+    # --rm chat` reaches it directly regardless of this profile, since `run`
+    # takes an explicit service name (verified: unlike `up`, `run` is not
+    # filtered by inactive profiles).
+    profiles: ["tools"]
+    entrypoint: ["t2s-chat"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      T2S_DB_URL: ${T2S_DB_URL:-sqlite:////data/foundation/foundation.sqlite3}
+      T2S_SAMPLE_DB_DIR: /data/sample_dbs
+    volumes:
+      - sample_dbs:/data/sample_dbs
+      - foundation_meta:/data/foundation
+    stdin_open: true
+    tty: true
+
+  # ---------------------------------------------------------------------
+  # postgres — the metadata-store sidecar. Behind a profile so it is opt-in:
+  # plain `docker compose up` never starts it. See docker/README.md.
+  # ---------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-t2s}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-t2s}
+      POSTGRES_DB: ${POSTGRES_DB:-t2s}
+    ports:
+      - "${T2S_POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-t2s} -d ${POSTGRES_DB:-t2s}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  sample_dbs:
+  foundation_meta:
+  postgres_data:
