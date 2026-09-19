@@ -16,9 +16,9 @@ from nl_doubles import ScriptedClient, router_payload
 from t2s_core.errors import UpstreamError
 from t2s_core.ports import InferenceResponse
 from t2s_nl.intents import (
-    INTENTS,
     MAX_PLAN_DIRECTIVES,
     PLAN_SCHEMA,
+    WIRE_INTENTS,
     plan_from_payload,
 )
 from t2s_nl.router import RouterContext, route
@@ -45,7 +45,12 @@ class _FailingClient:
 
 def test_the_wire_schema_pins_the_enum_and_the_plan_cap() -> None:
     directive = PLAN_SCHEMA["properties"]["directives"]["items"]
-    assert directive["properties"]["intent"]["enum"] == list(INTENTS)
+    # WIRE_INTENTS, not INTENTS: `cancel` exists in the taxonomy and is
+    # deliberately absent from the wire, because answering a destruction prompt
+    # is read in code and must not be something a model can claim to have
+    # decided (W17).
+    assert directive["properties"]["intent"]["enum"] == list(WIRE_INTENTS)
+    assert "cancel" not in directive["properties"]["intent"]["enum"]
     assert directive["additionalProperties"] is False
     assert set(directive["required"]) == set(directive["properties"])
     assert PLAN_SCHEMA["additionalProperties"] is False

@@ -36,6 +36,27 @@ Three rules define the boundary, and the third is the important one:
 The refusal is a :attr:`Plan.refusal`, which is the shape D15 already defined
 for "nothing was executed" -- an over-long plan and an ungeneratable one are the
 same kind of answer, and they get the same handling in ``execute_plan``.
+
+**W17 adds two things this module must be honest about.**
+
+*Destructive intents are routable here, and that is safe*, because routing
+``destroy`` does not destroy anything: it produces a description of what would
+be lost and a question. The confirmation itself is read by
+``t2s_nl.confirmation``, which is keyword matching too -- so the destructive
+lifecycle is one of the few flows that works *identically* with and without a
+model. What this module refuses to do is guess between ``destroy`` and
+``clear_data`` when an utterance supports both readings; it asks, exactly as the
+router prompt tells the model to.
+
+*It has no conversational memory and does not pretend to.* ``RouterContext`` now
+carries recent turns (``t2s_nl.history``) for the model's benefit. This module
+**never reads them** -- there is no keyword technique for "the one I already
+mentioned" that is not a guess dressed up as a feature, and a wrong guess here
+picks which database to delete. An utterance that leans on earlier conversation
+gets :data:`NO_HISTORY_QUESTION`: a plain statement that keyword routing cannot
+resolve back-references, and a request to name the thing. A test pins the
+property by classifying every corpus utterance with and without history and
+asserting the two are identical.
 """
 
 from __future__ import annotations
@@ -62,6 +83,7 @@ __all__ = [
     "DEFAULT_REASON",
     "GENERATION_INTENTS",
     "KEYLESS_ROUTING_NOTE",
+    "NO_HISTORY_QUESTION",
     "OFFLINE_ROUTING_NOTE",
     "classify",
 ]
@@ -113,6 +135,18 @@ _EXECUTE = _compile(
     r"\b(show|give) me the results\b",
     r"\bwhat (are|were) the results\b",
     r"\bgo ahead and run\b",
+)
+
+#: `export` copies a file and says where it went -- no model, no generation, so
+#: it is routable here like `inspect` and `execute`. It belongs with the intent:
+#: a value in the enum the keyword router cannot reach is a value that silently
+#: stops working the moment there is no key.
+_EXPORT = _compile(
+    r"\bexport\b",
+    r"\b(save|write|give|get|hand) (me )?(a |the )?(copy|snapshot|dump|file)\b",
+    r"\b(copy|snapshot) of (the|this|that|my) (database|db|data)\b",
+    r"\b(db browser|datagrip|sqlite3 shell|my own tools?)\b",
+    r"\bas a (sqlite )?file\b",
 )
 
 _LOAD_DATA = _compile(
@@ -238,6 +272,45 @@ _INSPECT_RULES: Final[tuple[tuple[InspectTarget, tuple[re.Pattern[str], ...]], .
     ),
 )
 
+#: W17. Utterances whose subject lives in an earlier turn. The model gets a
+#: bounded history block and can resolve these; this module gets nothing and
+#: says so. Checked before everything else, because "I already mentioned it -
+#: delete it" would otherwise route to a destructive action whose target we
+#: would have to invent.
+_HISTORY_REFERENCE = _compile(
+    r"\bi (already |just )?(mentioned|said|told you)\b",
+    r"\b(like|as) i (said|mentioned|told you)\b",
+    r"\b(the|that) one i (mentioned|said|named|asked about)\b",
+    r"\bdo(n'?t| not)? you (not )?(have|remember|recall)\b",
+    r"\bthat context\b",
+    r"\bsame (one|thing) as (before|last time)\b",
+)
+
+NO_HISTORY_QUESTION: Final = (
+    "I'm routing by keyword rather than by the model ({reason}), and keyword matching "
+    "has no memory of earlier turns — I can see what you just typed and nothing else. "
+    "I won't guess which thing you meant, so please name it: the data model's name, or "
+    "the database's id from /dbs."
+)
+
+#: The instance itself goes. Every pattern pairs a destructive verb with a word
+#: that means "the database", so "delete the rows" never lands here.
+_DESTROY = _compile(
+    r"\b(delete|destroy|drop|remove|nuke|obliterate|trash|scrap)\b[^.]{0,40}?"
+    r"\b(database|databases|db|dbs|instance)\b",
+    r"\b(blow (it |that )?away|tear (it |that )?down|get rid of)\b",
+    r"\b(delete|destroy|drop|remove) (it|that|this|them)\b",
+    r"\btotally delete\b",
+)
+
+#: The rows go, the instance stays.
+_CLEAR_DATA = _compile(
+    r"\b(clear|empty|wipe|truncate|purge|flush|blank)\b[^.]{0,40}?"
+    r"\b(data|rows|tables?|database|db|it|out)\b",
+    r"\b(delete|remove|drop) (all (of )?)?(the )?(rows|data|records)\b",
+    r"\bstart (over|again|fresh)\b[^.]{0,20}?\b(no|without|empty) data\b",
+)
+
 _CORRECTIVE = _compile(
     r"^\s*actually\b",
     r"\bactually,",
@@ -308,15 +381,44 @@ _CONNECTOR = re.compile(
 
 _PRONOUN = re.compile(r"\b(that|it|this|them|the query|the sql)\b", re.IGNORECASE)
 
+#: Internal sentinels. A ``_Match`` carrying one of these is an honest question,
+#: not a classification, and :func:`classify` renders it with the reason there is
+#: no model -- which only the caller knows.
+_HISTORY_MARKER: Final = "__history__"
+
+_AMBIGUOUS_QUESTION: Final = (
+    "That reads two ways and I won't pick for you: do you want the sample database "
+    "EMPTIED (the rows go, the database stays and can be reloaded), or DESTROYED (the "
+    'database instance itself goes)? One of those cannot be undone. Say "empty it" or '
+    '"destroy it".'
+)
+
+#: The name in front of "database"/"db"/"instance" -- "the sports league database"
+#: -> "sports league". Narrow on purpose: an unfilled ``model_ref`` makes the
+#: orchestrator fall back to the session's current database or ask, and both are
+#: better than confidently naming the wrong one.
+_NAMED_OBJECT = re.compile(
+    r"\b(?:the|my|that|this)?\s*([a-z0-9][a-z0-9 '_-]{0,40}?)\s+(?:database|db|instance)\b",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class _Match:
-    """One segment's classification, plus the literal cue it matched on."""
+    """One segment's classification, plus the literal cue it matched on.
+
+    ``question`` is set when the honest answer is a question rather than an
+    intent -- an utterance that leans on earlier turns, or one that reads as
+    both ``destroy`` and ``clear_data``. It rides on the match instead of being
+    re-derived later so that the thing which *found* the ambiguity is the thing
+    that words it.
+    """
 
     intent: Intent
     cue: str
     parameters: Parameters = field(default_factory=Parameters)
     referent: Referent = "none"
+    question: str | None = None
 
 
 #: The dispatch order, as data rather than as a ladder of ``if``s, so that the
@@ -328,6 +430,7 @@ class _Match:
 #: I have" contains the word ``model``).
 _STAGES: Final[tuple[tuple[tuple[re.Pattern[str], ...], Callable[[str, str], _Match]], ...]] = (
     (_HELP, lambda segment, cue: _Match("help", cue)),
+    (_EXPORT, lambda segment, cue: _Match("export", cue)),
     (
         _EXECUTE,
         lambda segment, cue: _Match(
@@ -386,6 +489,14 @@ def classify(
         )
 
     matches = [_classify(segment, context) for segment in segments]
+    if asked := next((m.question for m in matches if m.question), None):
+        # W17: a question beats every other reading of the utterance. Both cases
+        # that produce one are cases where continuing would mean guessing at
+        # which object to delete.
+        return _asking(
+            NO_HISTORY_QUESTION.format(reason=reason) if asked == _HISTORY_MARKER else asked,
+            note,
+        )
     if len(matches) > 1 and any(m.intent == "unknown" for m in matches):
         # "Support multi-directive splits where unambiguous." A split that
         # leaves a piece we cannot name is exactly the ambiguous case, so we
@@ -429,14 +540,37 @@ def _split(text: str) -> list[str]:
     return [p for p in parts if p] or [text]
 
 
-def _classify(segment: str, context: RouterContext | None) -> _Match:
+def _classify(segment: str, context: RouterContext | None) -> _Match:  # noqa: PLR0911
     """One segment → one intent. Ordered: the guards that must win, first.
 
     ``load_data`` precedes ``inspect`` because "fill the database with about 25
     rows per table" contains both a database cue and a rows cue and is neither
     question. ``inspect`` precedes the generation cues because "what models do I
     have" contains the word ``model``.
+
+    W17 puts two guards ahead of all of it, and both answer with a *question*:
+
+    * a back-reference to an earlier turn, which this module cannot see;
+    * an utterance that reads as both ``destroy`` and ``clear_data``.
+
+    Both could be guessed at. Neither should be, because both guesses end at the
+    same place -- deleting something the user did not mean.
+
+    ``context`` is used only for table-name extraction. ``context.recent`` is
+    never read here; see the module docstring.
     """
+    if cue := _first(_HISTORY_REFERENCE, segment):
+        return _Match("unknown", cue, question=_HISTORY_MARKER)
+
+    destroy_cue = _first(_DESTROY, segment)
+    clear_cue = _first(_CLEAR_DATA, segment)
+    if destroy_cue and clear_cue:
+        return _Match("unknown", f"{destroy_cue} / {clear_cue}", question=_AMBIGUOUS_QUESTION)
+    if destroy_cue:
+        return _Match("destroy", destroy_cue, Parameters(model_ref=_named_object(segment)))
+    if clear_cue:
+        return _Match("clear_data", clear_cue, Parameters(model_ref=_named_object(segment)))
+
     for patterns, build in _STAGES:
         if cue := _first(patterns, segment):
             return build(segment, cue)
@@ -505,6 +639,45 @@ def _table(segment: str, context: RouterContext | None) -> str | None:
         if candidate not in _TABLE_STOPWORDS:
             return candidate
     return None
+
+
+#: Words that can sit between a destructive verb and the word "database" without
+#: being part of anything's name. The verbs are here because the regex has to
+#: start loose enough to catch "delete the sports league database" and therefore
+#: also catches "delete".
+_OBJECT_NOISE: Final[frozenset[str]] = frozenset(
+    {
+        "blow", "clear", "delete", "destroy", "drop", "empty", "flush", "get", "nuke",
+        "obliterate", "of", "out", "please", "purge", "remove", "rid", "scrap", "totally",
+        "trash", "truncate", "wipe",
+    }
+) | _TABLE_STOPWORDS  # fmt: skip
+
+
+def _named_object(segment: str) -> str | None:
+    """The name in front of "database", with the verbs and articles taken off.
+
+    Returns ``None`` rather than a guess whenever nothing is left -- "drop that
+    database" names nothing, and the orchestrator resolving that against the
+    session's current database is right, while inventing the name "drop" is a
+    lookup that fails or, worse, matches.
+    """
+    match = _NAMED_OBJECT.search(segment)
+    if not match:
+        return None
+    name = " ".join(w for w in match.group(1).split() if w.lower() not in _OBJECT_NOISE).strip()
+    return name or None
+
+
+def _asking(question: str, note: str) -> Plan:
+    """An ``unknown`` plan whose clarifying question is the whole answer."""
+    return Plan(
+        directives=[Directive(intent="unknown", rationale="keyword router will not guess")],
+        confidence="low",
+        routed_by="keyword",
+        routing_note=note,
+        clarifying_question=question,
+    )
 
 
 def _refused(refusal: str, note: str) -> Plan:

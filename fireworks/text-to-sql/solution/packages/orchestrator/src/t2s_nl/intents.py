@@ -1,6 +1,6 @@
 """The intent taxonomy, the directive/plan model, and the schema that pins them.
 
-The eight classifications are MAIN.md's six, verbatim in meaning, plus two the
+The classifications are MAIN.md's six, verbatim in meaning, plus the ones the
 design work added:
 
 ================= ===============================================================
@@ -11,8 +11,27 @@ design work added:
 ``load_data``     generate sample data and load it into a sample database
 ``execute``       run the current/named query against a loaded database
 ``corrective``    D13: a durable domain fact ("actually, revenue is in cents")
+``clear_data``    W17: empty a sample database's rows, keeping the instance
+``destroy``       W17: delete a sample database instance entirely
+``cancel``        W17: "no, don't" -- never on the wire, see below
 ``unknown``       the router could not tell -- ask, never guess
 ================= ===============================================================
+
+**W17: two of these are destructive, and one of them is not routable.** The
+workbench could create, load, query and execute, and had no way at all to
+*undo* any of it -- Chris asked to delete a sample database and was correctly
+told the workbench has no such command. ``destroy`` and ``clear_data`` are that
+command, and because they are the first irreversible things layer 3 can do,
+neither ever runs on the utterance that asked for it: the orchestrator
+describes exactly what would be lost and requires an affirmative next turn
+(``t2s_nl.confirmation``).
+
+``cancel`` is in :data:`INTENTS` and deliberately **not** in
+:data:`WIRE_INTENTS`, so it is absent from the JSON schema the model fills in.
+It is produced only by reading a "no" against a pending confirmation, in code,
+with no model involved -- the same discipline as ``Plan.routed_by``: a field the
+model cannot set is a field the model cannot lie about. Answering a destruction
+prompt is not a classification problem and must not become one.
 
 **D15: one utterance yields an ordered list of directives, not one intent.**
 "Show me the query for unpaid balances and sample results" is two directives
@@ -50,6 +69,7 @@ from typing import Any, Literal, cast, get_args
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 __all__ = [
+    "DESTRUCTIVE_INTENTS",
     "INTENTS",
     "MAX_PLAN_DIRECTIVES",
     "PLAN_SCHEMA",
@@ -63,6 +83,7 @@ __all__ = [
     "Plan",
     "Referent",
     "RoutedBy",
+    "WIRE_INTENTS",
     "plan_from_payload",
 ]
 
@@ -74,6 +95,10 @@ Intent = Literal[
     "load_data",
     "execute",
     "corrective",
+    "clear_data",
+    "destroy",
+    "export",
+    "cancel",
     "unknown",
 ]
 
@@ -112,6 +137,15 @@ Confidence = Literal["high", "medium", "low"]
 RoutedBy = Literal["model", "keyword"]
 
 INTENTS: tuple[str, ...] = get_args(Intent)
+
+#: The intents a destructive-confirmation gate stands in front of (W17). Neither
+#: ever executes on the turn that asked for it.
+DESTRUCTIVE_INTENTS: frozenset[str] = frozenset({"destroy", "clear_data"})
+
+#: What the model is allowed to choose from. ``cancel`` is ours: it is how a
+#: deterministic "no" to a pending confirmation is expressed, it is never
+#: offered on the wire, and :func:`plan_from_payload` rejects it on arrival.
+WIRE_INTENTS: tuple[str, ...] = tuple(i for i in INTENTS if i != "cancel")
 _TARGETS: tuple[str, ...] = get_args(InspectTarget)
 _REFERENTS: tuple[str, ...] = get_args(Referent)
 
@@ -147,7 +181,12 @@ class Parameters(BaseModel):
     inspect_target: InspectTarget = "unspecified"
     table: str | None = Field(default=None, description="A table the user named, e.g. 'orders'.")
     model_ref: str | None = Field(
-        default=None, description="A saved data model the user named, by name or UUID."
+        default=None,
+        description=(
+            "A saved object the user named, by name or UUID -- a data model, or "
+            "the sample database they identified by its model's name. This is how "
+            "destroy/clear_data say *which* instance."
+        ),
     )
     row_count: int | None = Field(
         default=None, ge=1, le=10_000, description="How many rows the user asked for."
@@ -210,6 +249,12 @@ class Plan(BaseModel):
     #: the plan was not the model's work. Set by ``t2s_nl.offline_router``, which
     #: is the only place that knows *why* there was no model to ask.
     routing_note: str | None = None
+    #: Things that happened *while routing* which the user has to be told about,
+    #: shown on the first turn of the plan. W17's case is the only one so far and
+    #: it is not optional: a pending destruction that this utterance invalidated
+    #: must be reported, or a later "yes" silently does nothing and the user has
+    #: no way to know why. Ours, never on the wire.
+    notes: list[str] = Field(default_factory=list)
 
     @property
     def primary(self) -> Directive:
@@ -261,7 +306,15 @@ def _param_schema() -> dict[str, Any]:
                 ),
             },
             "table": {"type": ["string", "null"]},
-            "model_ref": {"type": ["string", "null"]},
+            "model_ref": {
+                "type": ["string", "null"],
+                "description": (
+                    "The saved object the user named, in their own words -- 'the sports "
+                    "league database', 'bookstore'. Required for destroy and clear_data "
+                    "whenever the user named one; null when they said only 'it' or 'this "
+                    "one', which the orchestrator resolves from the conversation."
+                ),
+            },
             "row_count": {"type": ["integer", "null"]},
             "seed": {"type": ["integer", "null"]},
             "text": {
@@ -282,7 +335,40 @@ def _directive_schema() -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
-            "intent": {"type": "string", "enum": list(INTENTS)},
+            "intent": {
+                "type": "string",
+                "enum": list(WIRE_INTENTS),
+                "description": (
+                    "What this directive asks the system to do. "
+                    "'help' = a question about this system. "
+                    "'inspect' = a question about the user's own saved objects. "
+                    "'create_schema' = design or revise a data model and its DDL. "
+                    "'query' = turn a question about the DATA into SQL. "
+                    "'load_data' = generate sample rows and load them. "
+                    "'execute' = run SQL against the loaded sample database. "
+                    "'corrective' = record a durable domain fact. "
+                    # The two destructive ones are the pair most at risk of being
+                    # conflated, and conflating them is exactly what produced the
+                    # bad turn W17 exists to fix ("clear out ... just totally
+                    # delete it" offered both readings in one sentence). State
+                    # the difference in terms of what SURVIVES, not in terms of
+                    # the verb, because the verbs overlap in English and the
+                    # outcomes do not.
+                    "'clear_data' = DELETE THE ROWS ONLY from a sample database: "
+                    "the database instance, its tables and its schema all survive "
+                    "and it can be reloaded. Use for 'empty it', 'wipe the data', "
+                    "'truncate the tables', 'clear out the rows', 'start again with "
+                    "no data'. "
+                    "'destroy' = DELETE THE SAMPLE DATABASE INSTANCE ITSELF: the "
+                    "file and its tables are gone and the id stops resolving. Use "
+                    "for 'delete the database', 'drop it', 'destroy the instance', "
+                    "'get rid of it entirely', 'blow it away'. "
+                    "If the user's words fit both readings and nothing settles it, "
+                    "choose 'unknown' and ask which they mean -- do not guess "
+                    "between them, because one of the two cannot be undone. "
+                    "'unknown' = you cannot tell; ask instead of guessing."
+                ),
+            },
             "parameters": _param_schema(),
             "referent": {
                 "type": "string",
@@ -417,7 +503,11 @@ def _directive_from(item: object) -> Directive | None:
     if not isinstance(item, dict):
         return None
     raw_intent = item.get("intent")
-    if not isinstance(raw_intent, str) or raw_intent not in INTENTS:
+    if not isinstance(raw_intent, str) or raw_intent not in WIRE_INTENTS:
+        # WIRE_INTENTS, not INTENTS: `cancel` is not offered on the wire and is
+        # not accepted off it either. A model that emits it -- by echoing this
+        # docstring, by hallucination, or because someone talked it into one --
+        # gets the same treatment as any other unrecognised label.
         return None
     intent = cast("Intent", raw_intent)
 

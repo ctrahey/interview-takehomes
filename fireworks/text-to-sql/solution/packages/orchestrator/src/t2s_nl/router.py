@@ -12,6 +12,14 @@ It is given a *checklist* of what exists in the session (does a current model
 exist? is a database loaded?) so pronouns resolve -- but never the contents of
 any of it, so there is nothing for it to parrot back as fact.
 
+**W17: and a short record of recent turns.** The checklist alone could not
+answer "I already mentioned it - do you not have that context?", because it said
+what existed and nothing about what had been said. The record comes out of the
+D14 activity log (``t2s_nl.history``), is bounded in both turns and characters,
+and is framed as data in its own delimited block -- an imperative that was
+classified as data on turn 1 does not get to become an instruction by being
+quoted back on turn 4.
+
 Degradation, per inference-findings: the enum is enforced on the wire (D7) and
 validated again on arrival; a truncated, unparseable or mislabelled answer
 becomes a one-directive ``unknown`` plan plus a clarifying question. Transport
@@ -34,8 +42,10 @@ from dataclasses import dataclass
 
 from t2s_core.errors import FixtureNotFound, T2SError
 from t2s_core.ports import InferenceClient, InferenceResponse, Message
+from t2s_nl import history as history_module
 from t2s_nl import offline_router
 from t2s_nl.clients import NO_MODEL_AVAILABLE, MissingApiKey
+from t2s_nl.history import RecentTurn
 from t2s_nl.intents import (
     MAX_PLAN_DIRECTIVES,
     PLAN_SCHEMA,
@@ -79,6 +89,21 @@ class RouterContext:
     has_last_query: bool = False
     last_question: str | None = None
     corrective_count: int = 0
+    #: The last few turns of this conversation, oldest first (W17). Built from
+    #: the activity log by ``t2s_nl.history``; empty for a fresh session and for
+    #: any caller that does not supply one, which is what keeps every existing
+    #: fixture and every direct ``route()`` call unchanged.
+    recent: tuple[RecentTurn, ...] = ()
+
+    def history_lines(self) -> str:
+        """The recent-turn block, or ``""`` when there is nothing to say.
+
+        Empty is the common case for turn one and must render as *nothing* --
+        an empty "earlier turns" section is a section the model has to read and
+        then discount, and it would change every existing fixture key for the
+        privilege.
+        """
+        return history_module.render(self.recent)
 
     def as_lines(self) -> str:
         lines = [
@@ -118,6 +143,7 @@ def route(
             REGISTRY.render(
                 "router.user",
                 state_context=REGISTRY.render("router.state", state_lines=ctx.as_lines()),
+                history_context=_history_context(ctx),
                 utterance=utterance,
             ),
         ),
@@ -170,6 +196,19 @@ def route(
     if on_response is not None:
         on_response(response)
     return plan_from_payload(response.content)
+
+
+def _history_context(ctx: RouterContext) -> str:
+    """The delimited recent-turn block, or the empty string.
+
+    Rendered through its own pinned template rather than inlined here, for the
+    same reason every other prompt in this repo is a file: the framing that
+    makes replayed user text safe is the part most worth diffing.
+    """
+    lines = ctx.history_lines()
+    if not lines:
+        return ""
+    return REGISTRY.render("router.history", history_lines=lines)
 
 
 def no_model_reason(exc: T2SError) -> str:

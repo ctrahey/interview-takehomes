@@ -14,6 +14,7 @@ three properties that make that acceptable rather than dishonest:
 
 from __future__ import annotations
 
+import dataclasses
 import inspect as inspect_module
 import re
 from pathlib import Path
@@ -47,7 +48,12 @@ from t2s_nl.offline_router import (
 )
 from t2s_nl.orchestrator import Orchestrator
 from t2s_nl.router import RouterContext, route
-from t2s_nl.scenarios import EMPTY_CONTEXT, LOADED_CONTEXT, ROUTER_CASES
+from t2s_nl.scenarios import (
+    CONTEXTS,
+    LOADED_CONTEXT,
+    RECALL_CONTEXT,
+    ROUTER_CASES,
+)
 from t2s_nl.store import Store
 
 # --------------------------------------------------------------------------
@@ -111,15 +117,48 @@ def test_it_agrees_with_every_live_captured_router_case() -> None:
     router must refuse. Anything else is a silent disagreement with the model
     we are standing in for.
     """
-    contexts = {"empty": EMPTY_CONTEXT, "loaded": LOADED_CONTEXT}
+    # CONTEXTS, not a local dict of two: the canonical contexts are data now, so
+    # adding a third (W17's `recall`) cannot silently skip cases here.
     disagreements = []
     for utterance, context_name, expected in ROUTER_CASES:
-        plan = classify(utterance, context=contexts[context_name])
+        plan = classify(utterance, context=CONTEXTS[context_name])
         got = plan.intents if plan.directives else ("REFUSED",)
         wants_generation = any(i in GENERATION_INTENTS for i in expected)
-        if not ((wants_generation and got == ("REFUSED",)) or got == expected):
+        # W17: one further outcome counts as agreement, and only for cases
+        # declared against the `recall` context -- **asking**. Those utterances
+        # are resolvable only from earlier conversation, which this module
+        # deliberately cannot see, so `unknown` plus a question is the honest
+        # result and a match would mean it had guessed. It must be a *question*
+        # though; a bare `unknown` is a dead end, so that is asserted rather
+        # than waved through.
+        needs_history = context_name == "recall"
+        honestly_asked = needs_history and got == ("unknown",) and bool(plan.clarifying_question)
+        if not ((wants_generation and got == ("REFUSED",)) or got == expected or honestly_asked):
             disagreements.append((utterance, expected, got))
     assert not disagreements
+
+
+def test_it_does_not_pretend_to_read_the_conversation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """W17's degradation contract, pinned two ways.
+
+    First: the keyword router's answer must be **identical** with and without a
+    history block on the context. Anything else would mean it had started using
+    a signal it has no honest way to interpret.
+
+    Second: an utterance that leans explicitly on earlier conversation gets a
+    question that says so, rather than a guess. The stakes are why -- the first
+    thing a back-reference is likely to name is which database to delete.
+    """
+    for utterance, context_name, _ in ROUTER_CASES:
+        base = CONTEXTS[context_name]
+        bare = dataclasses.replace(base, recent=())
+        loaded = dataclasses.replace(base, recent=RECALL_CONTEXT.recent)
+        assert classify(utterance, context=bare) == classify(utterance, context=loaded), utterance
+
+    asked = classify("delete the one I already mentioned", context=RECALL_CONTEXT)
+    assert asked.intents == ("unknown",)
+    assert "no memory of earlier turns" in (asked.clarifying_question or "")
+    assert asked.routed_by == "keyword"
 
 
 # --------------------------------------------------------------------------
@@ -279,8 +318,7 @@ def test_a_matching_fixture_always_wins(
     that was recorded, not from keywords that happen to agree with it.
     """
     _tripwire(monkeypatch)
-    contexts = {"empty": EMPTY_CONTEXT, "loaded": LOADED_CONTEXT}
-    plan = route(utterance, client=offline_client(), context=contexts[context_name])
+    plan = route(utterance, client=offline_client(), context=CONTEXTS[context_name])
     assert plan.routed_by == "model"
     assert plan.routing_note is None
 

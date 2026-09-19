@@ -130,6 +130,7 @@ def directive_payload(
     table: str | None = None,
     text: str | None = None,
     row_count: int | None = None,
+    model_ref: str | None = None,
     referent: str = "none",
     rationale: str = "test",
 ) -> dict[str, Any]:
@@ -139,7 +140,7 @@ def directive_payload(
         "parameters": {
             "inspect_target": inspect_target,
             "table": table,
-            "model_ref": None,
+            "model_ref": model_ref,
             "row_count": row_count,
             "seed": None,
             "text": text,
@@ -169,6 +170,7 @@ def router_payload(
     table: str | None = None,
     text: str | None = None,
     row_count: int | None = None,
+    model_ref: str | None = None,
     referent: str = "none",
     rationale: str = "test",
     clarifying_question: str | None = None,
@@ -182,6 +184,10 @@ def router_payload(
             table=table,
             text=text,
             row_count=row_count,
+            # Forwarded, deliberately and explicitly: a wrapper that accepts an
+            # argument and quietly drops it is the bug that orphaned every
+            # fixture it touched, twice in this project.
+            model_ref=model_ref,
             referent=referent,
             rationale=rationale,
         ),

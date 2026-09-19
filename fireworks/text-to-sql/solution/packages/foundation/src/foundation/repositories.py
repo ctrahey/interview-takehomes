@@ -14,7 +14,7 @@ keeps this layer trivially testable against an in-memory SQLite engine.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import func, select
@@ -30,6 +30,7 @@ from foundation.models import (
     DataModel,
     DataModelVersion,
     Dataset,
+    PendingAction,
     Project,
     Query,
     Schema,
@@ -238,6 +239,19 @@ class DatabaseRepository:
         if row is None:
             raise ValueError(f"no database with id {database_id}")
         row.status = DatabaseStatus.LOADED
+        self.db.flush()
+
+    def mark_empty(self, database_id: uuid.UUID) -> None:
+        """Back to `created`: the instance is there, the rows are not (W17).
+
+        The inverse of `mark_loaded`, and the reason `clear` is a distinct
+        lifecycle operation rather than destroy-then-recreate -- the id, and
+        therefore everything pointing at it, survives.
+        """
+        row = self.db.get(Database, database_id)
+        if row is None:
+            raise ValueError(f"no database with id {database_id}")
+        row.status = DatabaseStatus.CREATED
         self.db.flush()
 
     def mark_destroyed(self, database_id: uuid.UUID) -> None:
@@ -500,3 +514,75 @@ class ActivityRepository:
                     pending.pop(0)
             open_rows.extend(pending)
         return sorted(open_rows, key=lambda r: r.seq)
+
+
+class PendingActionRepository:
+    """The one destructive request a session is currently waiting on (W17).
+
+    Three transitions and no more: `request` creates or replaces it, `get`
+    reads it (and drops it once it is older than `TTL_SECONDS`), `clear`
+    removes it. There is exactly one row per session, so a second request
+    replaces the first rather than queueing behind it -- "delete A", "no, B",
+    "yes" can only ever destroy B.
+
+    Unlike `ActivityRepository` this table is *meant* to be mutable and
+    deletable. The two are complementary: the log is the immutable record that
+    destruction was asked for and what came of it; this row is the live
+    permission, and a permission that cannot be revoked is not a permission.
+    """
+
+    #: How long an unanswered confirmation stands. Five minutes is long enough
+    #: to read what will be destroyed and short enough that a "yes" typed into
+    #: a terminal left open over lunch destroys nothing.
+    TTL_SECONDS = 300
+
+    def __init__(self, db: OrmSession) -> None:
+        self.db = db
+
+    def request(
+        self,
+        session_id: uuid.UUID,
+        *,
+        action: str,
+        description: str,
+        database_id: uuid.UUID | None = None,
+        detail: dict[str, Any] | None = None,
+        requested_seq: int | None = None,
+        at: datetime | None = None,
+    ) -> PendingAction:
+        row = self.db.get(PendingAction, session_id)
+        if row is None:
+            row = PendingAction(session_id=session_id, action=action, description=description)
+            self.db.add(row)
+        row.action = action
+        row.description = description
+        row.database_id = database_id
+        row.detail = detail
+        row.requested_seq = requested_seq
+        row.requested_at = at or datetime.now(UTC)
+        self.db.flush()
+        return row
+
+    def get(self, session_id: uuid.UUID, *, now: datetime | None = None) -> PendingAction | None:
+        """The live pending action, or ``None`` if there is none or it has expired.
+
+        Expiry is enforced on read and the stale row is deleted, so there is no
+        way to observe an expired confirmation as live -- the check cannot be
+        forgotten by a caller because there is no other way to get the row.
+        """
+        row = self.db.get(PendingAction, session_id)
+        if row is None:
+            return None
+        requested = row.requested_at
+        if requested.tzinfo is None:  # SQLite has no timezone type
+            requested = requested.replace(tzinfo=UTC)
+        if (now or datetime.now(UTC)) - requested > timedelta(seconds=self.TTL_SECONDS):
+            self.clear(session_id)
+            return None
+        return row
+
+    def clear(self, session_id: uuid.UUID) -> None:
+        row = self.db.get(PendingAction, session_id)
+        if row is not None:
+            self.db.delete(row)
+            self.db.flush()

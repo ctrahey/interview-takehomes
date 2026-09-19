@@ -1,9 +1,10 @@
 """SQLAlchemy 2.x ORM models (design §4).
 
 Entities: `Project`, `Session`, `DataModel`, `DataModelVersion`, `Schema`,
-`Query`, `Dataset`, `Database`, plus the two conversational tables
-`SessionState` (pointers) and `Activity` (the append-only transition log,
-D14). All primary keys are UUIDs (MAIN.md
+`Query`, `Dataset`, `Database`, plus the conversational tables
+`SessionState` (pointers), `Activity` (the append-only transition log, D14)
+and `PendingAction` (a destructive request awaiting a "yes", W17).
+All primary keys are UUIDs (MAIN.md
 clarification 3), stored via SQLAlchemy's portable `Uuid` type.
 
 Relationships, derived from `prompts/MAIN.md`'s domain-object descriptions:
@@ -402,3 +403,47 @@ class Activity(Base):
         Index("ix_activities_session_seq", "session_id", "seq"),
         Index("ix_activities_session_kind", "session_id", "kind"),
     )
+
+
+class PendingAction(Base):
+    """A destructive action that has been described to the user and is awaiting a "yes".
+
+    W17. Destroying a sample database is the first thing layer 3 can do that is
+    not undoable, so it is the first thing that must not happen on a single
+    utterance. The rule is: **describe precisely, then require an affirmative in
+    the next turn.** That requirement only means anything if the request
+    survives the turn boundary, which is what this row is.
+
+    Deliberately *not* the activity log. `Activity` is append-only because it is
+    a record of the past; this is live state with exactly three transitions --
+    created, consumed, invalidated -- and it must be deletable, because a
+    pending confirmation that outlives the user's attention is precisely the
+    hazard. Both are written: the log records that destruction was asked for and
+    what came of it (D14), and this row is what makes the next "yes" meaningful.
+
+    One row per session (the PK *is* `session_id`): a second request replaces
+    the first, so "delete A" / "no wait, delete B" / "yes" can only ever destroy
+    B. `requested_seq` pins the request to the activity row that described it,
+    so the log and the pending state cannot disagree about which destruction was
+    approved.
+    """
+
+    __tablename__ = "pending_actions"
+
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("sessions.id"), primary_key=True
+    )
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    database_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("databases.id"), nullable=True
+    )
+    #: The exact sentence the user was shown. Replayed verbatim on confirmation
+    #: so what is destroyed is what was described, not a re-derivation of it.
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    detail: Mapped[dict | None] = mapped_column(SA_JSON, nullable=True)
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
+    )
+    requested_seq: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    session: Mapped[Session] = relationship()
