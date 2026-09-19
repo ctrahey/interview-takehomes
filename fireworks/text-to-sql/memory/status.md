@@ -49,6 +49,8 @@ local-sandbox-only and must not be baked into CI.
 | W10 orchestrator (layer 3) | **done** — `t2s_nl` + `t2s-chat`; 104 tests, 38 live-captured fixtures | opus |
 | W13 activity log + directive plans (D14/D15) | **done** — `make check` green, 536 tests | opus |
 | W14 containerization | **done** — Dockerfile + docker-compose.yml, `make check` green, 544 tests | sonnet |
+| W16 offline router + keyless chat | **done** — `make check` green, 653 tests | opus |
+| W15 conversational HTTP surface | **done** — chat + activity log + SSE, `make check` green, 572 tests | opus |
 
 ## W14 — containerization (2026-09-18)
 `Dockerfile` (multi-stage, uv-based, python:3.12-slim-bookworm, non-root, 354MB final image),
@@ -75,10 +77,10 @@ length in `docker/README.md` (what it would take: an engine-backend port on `fou
 D9's three-layer enforcement re-derived for Postgres semantics, per-database isolation without "just
 a file", and a decision on what the eval corpus means once Postgres is executable).
 
-**Discovered, not fixed (orchestrator out of scope):** `t2s_api` defers building a live
-`FireworksClient` until a layer-2 request needs one, so the API starts with no key. `t2s-chat`
-(orchestrator) does not — it fails fast at startup with no key. Both are reasonable; noted for W15+
-in case a consistent story is wanted later.
+**Discovered in W14, fixed in W16:** `t2s_api` defers building a live `FireworksClient` until a
+layer-2 request needs one, so the API starts with no key. `t2s-chat` (orchestrator) did not — it
+failed fast at startup with no key. `t2s_nl.clients.DeferredFireworksClient` now gives the chat the
+same behaviour.
 
 
 
@@ -171,3 +173,107 @@ offline suite) and deleted; 46 remain, every one of them replayed by a test.
 Also fixed: `tests/nl_doubles.TripwireClient.complete` accepted `reasoning_effort` and did not
 forward it. Since the fixture key includes it when set, that wrapper silently orphaned every
 fixture it touched.
+
+
+## W15 — layer 3 over HTTP (2026-09-19)
+
+`POST /sessions/{id}/chat`, `GET /sessions/{id}/activities`, and an SSE stream of
+the same log at `/activities/stream`. Everything new is in `packages/api`; no file
+under `packages/orchestrator` or `packages/foundation` was touched. `t2s_nl` is now
+a declared dependency of `t2s_api` — the one direction MAIN.md's layering allows,
+and the three import contracts still hold.
+
+**The chat response is the executed plan, not an answer.** Built on
+`Orchestrator.plan()` + `execute_plan()` (what `run()` does internally), never on
+`handle()`, which returns only the last turn. `status` is `completed` | `halted` |
+`refused`: a halt carries the completed prefix in `results` and the unrun
+directives in `not_run`, on a 200. Each directive is paired with the turn it
+produced and the `seq` of the activity rows it appended — attributed by a listener
+that marks a boundary at each completed turn, which is exact because a plan
+executes sequentially.
+
+**SSE.** An `ActivityBroker` on `app.state` is an `ActivityListener`; the chat
+endpoint passes it to the orchestrator. On the worker thread it does one
+`loop.call_soon_threadsafe(put_nowait)` per subscriber — no lock across I/O, no
+join, no await, and a full queue drops and counts rather than applying
+backpressure to an inference call. The stream generator's `finally` unsubscribes,
+so a dropped client leaks neither a listener nor a thread. Heartbeat comments every
+15s (`T2S_SSE_HEARTBEAT_SECONDS`). Reconnect: every event carries `id: <seq>`, so
+`Last-Event-ID` works for browsers and `?after_seq=` for everyone else; the backlog
+is read *after* subscribing and live rows ≤ the last replayed seq are skipped, so
+the join is gapless and duplicate-free.
+
+**Found by driving it live:** activity timestamps serialised with a `Z` when
+published live and without one when replayed out of SQLite (which has no timezone
+type), so the same row read as UTC on the stream and as local time on the page.
+`ActivityOut` now normalises to UTC and a test pins it.
+
+**Testing note.** starlette's `TestClient` buffers a response to completion, so an
+endless SSE stream hangs it. The six stream tests run against a real uvicorn on a
+loopback port — still offline, still no key, and it is what makes the disconnect
+and cross-origin assertions real. 28 new tests; 572 total.
+
+**Drive-live evidence:** a bookstore modelled, a sample database loaded, then
+"show me the query for the best selling authors and sample results" classified as
+`[query, execute]` and both halves returned in one response, while `curl -N` on the
+stream showed all 16 rows — the 10-row backlog, then the 6 live ones as they
+happened.
+
+
+## W16 — offline mode made usable: a deterministic keyword router (2026-09-19)
+
+`T2S_OFFLINE=1` replayed fixtures and nothing else, so "what models do I have?" died with
+`FixtureNotFound` and always would: fixture coverage of open-ended English is unbounded. New
+`t2s_nl/offline_router.py` classifies an utterance with keyword and pattern matching over the
+**same enum** the router's LLM call fills in — eight intents, eleven inspect targets. This is
+MAIN.md rule of thumb #3 (deterministic tooling over flowing everything through context) applied
+where it is actually tractable, which is exactly where the output space is small and fixed.
+
+**Coverage.** All ten `inspect` targets (databases, models, schemas, schema_detail, sample_rows,
+queries, sessions, correctives, state, activity), plus `help`, `execute`, `load_data`, and the
+`last_query` referent ("what's the SQL for that?" → a D14 log read). Extracts table (session table
+names beat grammar), row count, and seed. Splits on "and then"/"then"/"and also", and **backs out
+of the split** when any half is unnameable — that is what "unambiguous" means operationally.
+Measured against `scenarios.ROUTER_CASES`: **24/24 agreement** with what live `kimi-k2p7-code`
+actually decided, counting a refusal as agreement on the 8 generation cases.
+
+**The boundary, which is the point.** Routing is a choice over an enum; generation is not.
+`query`, `create_schema` and `corrective` produce text a model must write, so the keyword router
+**refuses them whole** (as a `Plan.refusal`, D15's existing "nothing was executed" shape) and says
+what would unblock it. A property test asserts that no utterance in any repo corpus can make it
+emit a generation directive. `load_data` is routable but its rows come from the model, so a second
+backstop in `Orchestrator.execute` turns a generation call with no model behind it into the same
+explanation. Nothing in either path synthesises SQL, DDL or rows.
+
+**Fixtures win, and it is inert online.** The recorded client is tried first; the fallback fires on
+exactly two exceptions — `FixtureNotFound` and the new `MissingApiKey` — both local, permanent and
+impossible for a client that has a key and a network. A 429, a 503 or a read timeout degrades to
+"ask the user" exactly as before. Proved three ways: all 24 captured utterances replay with the
+fallback booby-trapped; five live failure modes with the same tripwire; and a structural assertion
+that neither exception name appears in `FireworksClient`.
+
+**It says what it did.** `Plan.routed_by` / `Plan.routing_note` (ours, deliberately *not* on the
+wire, so a model cannot claim a provenance it does not have) become a visible note on every turn —
+`· offline: routed by keyword, not by the model`, or `· no API key: ...`. `/log` records
+`routed_by` in the activity detail and tags the summary `understood: inspect (keyword)`, so a
+transcript shows which turns the model classified and which it did not.
+
+**Keyless `t2s-chat`.** `DeferredFireworksClient` builds the live client on first `complete()`, so
+the REPL opens with no key, the banner says what will and will not work, every deterministic read
+works, plain English is keyword-routed, and the missing credential is explained at the point of
+need. The W14 asymmetry with `t2s_api` is closed.
+
+**CLI:** unchanged in substance — every `t2s` command is a *generation* command, so there is
+nothing to route; only the unfixtured-offline message now states the boundary instead of quoting a
+fixture hash.
+
+Verified live with `FIREWORKS_API_KEY` unset and `~/.fireworks-key` absent: all six target
+utterances answer from `foundation` on a fresh session; generation requests refuse; `t2s-chat`
+starts keyless and `/state` `/models` `/dbs` `/log` all work. `make check UV=$HOME/.local/bin/uv`
+green, **653 tests** (80 new in `packages/orchestrator/tests/test_offline_router.py`), 3 import
+contracts kept.
+
+**What offline still cannot do:** write SQL, design DDL, generate sample data, or record a
+corrective in your own words — all four need a model, by design. The keyword router is also a
+worse classifier than the model on wording it has no cue for; it answers `unknown` with a list of
+what it does understand rather than guessing.

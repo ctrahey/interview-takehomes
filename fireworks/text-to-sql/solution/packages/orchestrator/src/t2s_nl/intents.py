@@ -62,6 +62,7 @@ __all__ = [
     "Parameters",
     "Plan",
     "Referent",
+    "RoutedBy",
     "plan_from_payload",
 ]
 
@@ -102,6 +103,13 @@ InspectTarget = Literal[
 Referent = Literal["none", "last_query", "last_result", "last_schema", "last_data"]
 
 Confidence = Literal["high", "medium", "low"]
+
+#: Who cut the utterance into directives. ``"model"`` is the router's LLM call;
+#: ``"keyword"`` is ``t2s_nl.offline_router``, reached only when there is no
+#: model to ask. A surface MUST make ``"keyword"`` visible -- a keyword match
+#: presented as the model's judgement would be the system lying about its own
+#: provenance, which is the one thing this package exists to prevent.
+RoutedBy = Literal["model", "keyword"]
 
 INTENTS: tuple[str, ...] = get_args(Intent)
 _TARGETS: tuple[str, ...] = get_args(InspectTarget)
@@ -184,6 +192,11 @@ class Plan(BaseModel):
     ``refusal`` is set by us, never by the model: it is how an over-long or
     structurally unusable plan reports that *nothing was executed*, which is
     the difference between refusing and silently truncating.
+
+    ``routed_by`` is likewise ours. It is **not** in :data:`PLAN_SCHEMA` and
+    :func:`plan_from_payload` never reads it off the wire, so a model cannot
+    claim a provenance it does not have; the only way to get ``"keyword"`` is
+    for ``t2s_nl.offline_router`` to have built the plan itself.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -192,6 +205,11 @@ class Plan(BaseModel):
     confidence: Confidence = "medium"
     clarifying_question: str | None = None
     refusal: str | None = None
+    routed_by: RoutedBy = "model"
+    #: The one line a surface must show on every turn this plan produced, when
+    #: the plan was not the model's work. Set by ``t2s_nl.offline_router``, which
+    #: is the only place that knows *why* there was no model to ask.
+    routing_note: str | None = None
 
     @property
     def primary(self) -> Directive:

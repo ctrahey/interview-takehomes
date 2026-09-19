@@ -24,6 +24,7 @@ from typing import Any
 from foundation.graph import Column, EntityGraph, Table
 from t2s_core.errors import T2SError
 from t2s_core.ports import InferenceClient, Message
+from t2s_nl.clients import NO_MODEL_AVAILABLE
 from t2s_nl.prompts import REGISTRY
 
 __all__ = [
@@ -137,6 +138,13 @@ def generate_rows(
             # rows that satisfy a schema we already validate afterwards.
             reasoning_effort="none",
         )
+    except NO_MODEL_AVAILABLE:
+        # "There is no model at all" is not a data-generation failure, it is the
+        # absence of the thing that would generate. Let it through unwrapped so
+        # the orchestrator answers it with the one explanation that fits every
+        # such step, rather than a fixture-hash message dressed up as a data
+        # problem. Nothing is synthesised to fill the gap.
+        raise
     except T2SError as exc:
         raise DataGenerationError(str(exc)) from exc
 

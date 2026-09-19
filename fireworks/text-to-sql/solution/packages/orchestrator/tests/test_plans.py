@@ -218,7 +218,13 @@ def test_the_cap_refusal_is_recorded_as_a_refusal_not_an_error(
         row = ActivityRepository(db).latest(
             store.session_id, kind="router.classify", status="refused"
         )
-    assert row is not None and "too long" in (row.summary or "")
+    # The summary carries the refusal's own first sentence rather than a fixed
+    # string, because there is now more than one reason a plan is refused whole
+    # (the cap, and "that needs a model I do not have") and a log that cannot
+    # tell them apart cannot answer why nothing ran.
+    assert row is not None
+    assert "refused: " in (row.summary or "")
+    assert "separate things to do" in (row.summary or "")
 
 
 def test_the_cap_is_enforced_on_arrival_not_only_on_the_wire() -> None:

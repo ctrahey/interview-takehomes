@@ -17,6 +17,13 @@ validated again on arrival; a truncated, unparseable or mislabelled answer
 becomes a one-directive ``unknown`` plan plus a clarifying question. Transport
 failure (the API is down, the key is wrong) becomes the same, with the
 exception's message -- never a traceback into the chat loop.
+
+**When there is no model at all**, this module falls back to
+``t2s_nl.offline_router``, which classifies with keywords over the same enum.
+The ordering is the contract: the client is tried *first*, so a recorded fixture
+always wins, and the fallback is reached only on the two failures that mean no
+model exists here (see ``clients.NO_MODEL_AVAILABLE``). The resulting plan is
+stamped ``routed_by="keyword"`` so every surface can say so.
 """
 
 from __future__ import annotations
@@ -25,8 +32,10 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from t2s_core.errors import T2SError
+from t2s_core.errors import FixtureNotFound, T2SError
 from t2s_core.ports import InferenceClient, InferenceResponse, Message
+from t2s_nl import offline_router
+from t2s_nl.clients import NO_MODEL_AVAILABLE, MissingApiKey
 from t2s_nl.intents import (
     MAX_PLAN_DIRECTIVES,
     PLAN_SCHEMA,
@@ -35,9 +44,10 @@ from t2s_nl.intents import (
     Plan,
     plan_from_payload,
 )
+from t2s_nl.offline_router import KEYLESS_ROUTING_NOTE, OFFLINE_ROUTING_NOTE
 from t2s_nl.prompts import REGISTRY
 
-__all__ = ["ROUTER_MAX_TOKENS", "RouterContext", "route"]
+__all__ = ["ROUTER_MAX_TOKENS", "RouterContext", "no_model_reason", "route"]
 
 logger = logging.getLogger("t2s_nl.router")
 
@@ -127,6 +137,25 @@ def route(
             reasoning_effort="none",
             temperature=0.0,
         )
+    except NO_MODEL_AVAILABLE as exc:
+        # **Fixtures win, and this is where that is enforced**: the recorded
+        # client has already been asked and has said it has nothing for this
+        # request. Only then do we route with keywords instead of failing.
+        #
+        # This clause cannot fire online. Its two exception types come from a
+        # RecordedClient with no matching fixture and from having no credential
+        # at all; a live FireworksClient with a key raises neither, and a 429,
+        # a 503 or a read timeout falls through to the clause below exactly as
+        # it always did. A transient provider failure must never silently
+        # downgrade routing quality -- only a permanent, local, knowable-offline
+        # absence of any model does.
+        logger.info("no model available (%s); routing by keyword", type(exc).__name__)
+        return offline_router.classify(
+            utterance,
+            context=ctx,
+            reason=no_model_reason(exc),
+            note=OFFLINE_ROUTING_NOTE if isinstance(exc, FixtureNotFound) else KEYLESS_ROUTING_NOTE,
+        )
     except T2SError as exc:
         logger.warning("router inference failed: %s", type(exc).__name__)
         return Plan(
@@ -141,3 +170,12 @@ def route(
     if on_response is not None:
         on_response(response)
     return plan_from_payload(response.content)
+
+
+def no_model_reason(exc: T2SError) -> str:
+    """Why there is no model, in words a user can act on."""
+    if isinstance(exc, FixtureNotFound):
+        return "I'm in offline mode (T2S_OFFLINE=1) and no recorded fixture matches this wording"
+    if isinstance(exc, MissingApiKey):
+        return "there is no Fireworks API key set"
+    return str(exc)

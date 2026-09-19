@@ -21,6 +21,12 @@ Design notes that are requirements, not taste:
 * **One utterance can produce several answers** (D15). A two-directive plan
   prints two turns, labelled ``[1/2]``/``[2/2]``, each as it completes.
 * The API key is never printed, never logged, and never interpolated anywhere.
+* **It starts without one.** A missing key used to be a fail-fast exit 2 before
+  the user typed anything, while the API happily served its whole deterministic
+  layer keyless. That asymmetry is gone: the live client is built on first use,
+  so the REPL opens, every state read works, plain English is routed by keyword
+  (``t2s_nl.offline_router``, and it says so on every turn it routes), and the
+  credential is explained at the moment something actually needs to generate.
 """
 
 from __future__ import annotations
@@ -29,7 +35,6 @@ import argparse
 import atexit
 import contextlib
 import os
-import sys
 import traceback
 from collections.abc import Callable
 from pathlib import Path
@@ -41,7 +46,7 @@ except ImportError:  # pragma: no cover - Windows without pyreadline
     readline = None  # type: ignore[assignment]
 
 from t2s_nl import inspection
-from t2s_nl.clients import is_offline, make_client
+from t2s_nl.clients import api_key_available, is_offline, make_client
 from t2s_nl.live import LiveActivityDisplay
 from t2s_nl.orchestrator import HELP_TEXT, Orchestrator
 from t2s_nl.render import colorize, pretty_sql, render_table, render_turn
@@ -68,12 +73,37 @@ SLASH_HELP = """\
 All of these can also just be said in English."""
 
 
+def _mode_lines() -> list[str]:
+    """How this session will get its answers, said plainly at the top.
+
+    A REPL that will refuse to write SQL in four turns' time should say so in
+    turn zero. Both degraded modes still open the workbench -- that is the whole
+    point of the change -- so the banner's job is to set the right expectation,
+    not to apologise.
+    """
+    if is_offline():
+        lines = ["offline (recorded fixtures)"]
+        if not api_key_available():
+            lines.append(
+                "no API key: anything not in a fixture is routed by keyword, and "
+                "generation is refused rather than faked"
+            )
+        return lines
+    if not api_key_available():
+        return [
+            "no API key",
+            "everything about your own objects works; questions are routed by keyword, "
+            "and writing SQL or DDL will explain what it needs instead of guessing",
+        ]
+    return []
+
+
 def _banner(orch: Orchestrator) -> str:
-    mode = "offline (recorded fixtures)" if is_offline() else f"model {orch.client.model}"
+    mode = _mode_lines() or [f"model {orch.client.model}"]
     return "\n".join(
         [
             colorize("bold", "text-to-SQL — conversational workbench"),
-            colorize("dim", f"  {mode}"),
+            *(colorize("dim", f"  {line}") for line in mode),
             colorize("dim", f"  session {orch.store.session_id} · state in {orch.store.url}"),
             colorize("dim", "  describe a domain, ask a question, or /help"),
             "",
@@ -240,11 +270,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    try:
-        client = make_client()
-    except RuntimeError as exc:
-        print(f"t2s-chat: {exc}", file=sys.stderr)
-        return 2
+    # Never fails for a missing key. `t2s_api` has always deferred building a
+    # live client until a layer-2 request needs one; this is that, for the chat.
+    # The workbench opens, every deterministic read works, and the credential is
+    # explained at the point of need instead of at the door.
+    client = make_client()
 
     store = Store(args.db_url, session_slug=args.session)
     # D14: the live line. It animates only on a tty, so a piped or redirected

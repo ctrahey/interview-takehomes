@@ -7,6 +7,22 @@ sample-data exchanges, plus ``t2s_core``'s captured generation exchanges -- so
 :class:`ChainedRecordedClient` tries each in turn. The fixture key is a hash of
 the whole request (model, messages, schema, budget, temperature), so there is no
 ambiguity about which directory answers: at most one of them has the key.
+
+**No key is not a startup failure.** ``t2s_api`` has always deferred building a
+live ``FireworksClient`` until a layer-2 request needs one, so the API starts
+and serves its whole deterministic layer with no key at all; ``t2s-chat`` used
+to exit 2 at startup instead. That asymmetry was recorded in ``memory/status.md``
+and is fixed here by :class:`DeferredFireworksClient`, which resolves the key on
+first *use*. The consequence is the one that matters for a demo: the workbench
+opens, every deterministic read works, and the missing key is explained at the
+moment something actually needs inference.
+
+Two conditions in this module mean "there is no model here at all", as opposed
+to "the model is having a bad day": ``FixtureNotFound`` (offline replay, nothing
+recorded for this request) and :class:`MissingApiKey`. Both are local, permanent
+and knowable without touching the network, and **neither can be raised by a
+client that has a key and a connection** -- which is what makes them the safe
+trigger for ``t2s_nl.offline_router``'s keyword fallback.
 """
 
 from __future__ import annotations
@@ -21,18 +37,38 @@ from pydantic import SecretStr
 import t2s_core
 from t2s_core.clients import FireworksClient, RecordedClient
 from t2s_core.config import DEFAULT_MODEL, FireworksConfig
-from t2s_core.errors import FixtureNotFound
+from t2s_core.errors import FixtureNotFound, T2SError
 from t2s_core.ports import InferenceClient, InferenceResponse, Message
 
 __all__ = [
     "CORE_FIXTURE_DIR",
     "NL_FIXTURE_DIR",
+    "NO_MODEL_AVAILABLE",
     "ChainedRecordedClient",
+    "DeferredFireworksClient",
+    "MissingApiKey",
+    "api_key_available",
     "is_offline",
     "make_client",
     "offline_client",
     "read_api_key",
 ]
+
+
+class MissingApiKey(T2SError):
+    """No Fireworks credential, discovered at the point of need rather than at startup.
+
+    A ``T2SError`` so the router's existing degradation path catches it and
+    turns it into a conversational turn; never a traceback, and never carrying
+    any part of a key (there is none to carry).
+    """
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__(
+            "no Fireworks API key is set, so I cannot call a model"
+            + (f" ({detail})" if detail else "")
+        )
+
 
 NL_FIXTURE_DIR = Path(__file__).parent / "fixtures" / "inference"
 
@@ -116,12 +152,82 @@ def read_api_key() -> str:
     )
 
 
+def api_key_available() -> bool:
+    """Is there a key to be had, without reading its value?
+
+    Used only to word a banner. Deliberately does not return, log or compare the
+    key itself (D9).
+    """
+    if os.environ.get("FIREWORKS_API_KEY", "").strip():
+        return True
+    path = Path.home() / ".fireworks-key"
+    return path.exists() and bool(path.read_text(encoding="utf-8").strip())
+
+
+class DeferredFireworksClient:
+    """A live client that is not built until something actually calls it.
+
+    This is the whole of the fix for ``t2s-chat``'s fail-fast startup. ``model``
+    answers from configuration, so a banner and every deterministic read work
+    with no credential present; the key is read on the first :meth:`complete`,
+    and its absence surfaces there as :class:`MissingApiKey` -- an expected,
+    explainable condition at the point of need, not an exit code before the
+    user has typed anything.
+    """
+
+    def __init__(self, model: str | None = None) -> None:
+        self._model = model or os.environ.get("T2S_MODEL", DEFAULT_MODEL)
+        self._inner: InferenceClient | None = None
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    def _resolve(self) -> InferenceClient:
+        if self._inner is None:
+            try:
+                key = read_api_key()
+            except RuntimeError as exc:
+                raise MissingApiKey(str(exc)) from exc
+            self._inner = FireworksClient(
+                FireworksConfig(api_key=SecretStr(key), model=self._model)
+            )
+        return self._inner
+
+    def complete(
+        self,
+        messages: Sequence[Message],
+        *,
+        response_schema: Mapping[str, Any],
+        schema_name: str = "response",
+        max_tokens: int | None = None,
+        temperature: float = 0.0,
+        reasoning_effort: str | None = None,
+    ) -> InferenceResponse:
+        return self._resolve().complete(
+            messages,
+            response_schema=response_schema,
+            schema_name=schema_name,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+        )
+
+
+#: The two failures that mean "there is no model at all here", as opposed to
+#: "the provider is unhappy". Both are local and permanent: a ``RecordedClient``
+#: with no matching fixture, and no credential to build a live client with.
+#: Deliberately does NOT include ``UpstreamError``/``RateLimited``/
+#: ``TransportError`` -- those come from a client that *does* have a key and a
+#: network, i.e. from being online, and must never downgrade routing silently.
+NO_MODEL_AVAILABLE: tuple[type[T2SError], ...] = (FixtureNotFound, MissingApiKey)
+
+
 def make_client() -> InferenceClient:
-    """The live client, or the fixture replayer when ``T2S_OFFLINE=1``."""
+    """The live client, or the fixture replayer when ``T2S_OFFLINE=1``.
+
+    Never raises for a missing key: see :class:`DeferredFireworksClient`.
+    """
     if is_offline():
         return offline_client()
-    config = FireworksConfig(
-        api_key=SecretStr(read_api_key()),
-        model=os.environ.get("T2S_MODEL", DEFAULT_MODEL),
-    )
-    return FireworksClient(config)
+    return DeferredFireworksClient()

@@ -20,6 +20,13 @@ Public surface::
     Orchestrator(client=..., store=...).handle("...") -> Turn         (the last one)
     route(utterance, client=...) -> Plan
 
+When there is no model to ask at all -- offline replay with no matching
+fixture, or no API key -- ``route`` falls back to ``t2s_nl.offline_router``,
+which classifies over the same enum with keywords and marks the plan
+``routed_by="keyword"`` so the surface can say so. It routes; it never
+generates, and a request that needs generated text is refused with an
+explanation rather than answered with an invention.
+
 ``t2s-chat`` is the reference front end over exactly that surface. D14's
 activity log rides along on every turn: ``Orchestrator.activity`` is the
 emitter, and any object with ``on_begin``/``on_end`` can subscribe to it --
@@ -27,7 +34,14 @@ which is how the chat draws a live line while a slow step runs.
 """
 
 from t2s_nl.activity import ActivityEmitter, ActivityListener, ActivityRecord
-from t2s_nl.clients import ChainedRecordedClient, is_offline, make_client, offline_client
+from t2s_nl.clients import (
+    ChainedRecordedClient,
+    DeferredFireworksClient,
+    MissingApiKey,
+    is_offline,
+    make_client,
+    offline_client,
+)
 from t2s_nl.correctives import carry, compose_session_summary
 from t2s_nl.intents import (
     INTENTS,
@@ -38,6 +52,8 @@ from t2s_nl.intents import (
     Plan,
 )
 from t2s_nl.live import LiveActivityDisplay
+from t2s_nl.offline_router import OFFLINE_ROUTING_NOTE
+from t2s_nl.offline_router import classify as classify_offline
 from t2s_nl.orchestrator import HELP_TEXT, Orchestrator
 from t2s_nl.render import render_turn
 from t2s_nl.router import RouterContext, route
@@ -46,6 +62,7 @@ from t2s_nl.turns import DataTable, Turn
 
 __all__ = [
     "HELP_TEXT",
+    "OFFLINE_ROUTING_NOTE",
     "INTENTS",
     "MAX_PLAN_DIRECTIVES",
     "PLAN_SCHEMA",
@@ -54,15 +71,18 @@ __all__ = [
     "ActivityRecord",
     "ChainedRecordedClient",
     "DataTable",
+    "DeferredFireworksClient",
     "Directive",
     "Intent",
     "LiveActivityDisplay",
+    "MissingApiKey",
     "Orchestrator",
     "Plan",
     "RouterContext",
     "Store",
     "Turn",
     "carry",
+    "classify_offline",
     "compose_session_summary",
     "is_offline",
     "make_client",

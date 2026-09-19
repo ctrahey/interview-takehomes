@@ -72,13 +72,34 @@ from t2s_core.ports import InferenceClient
 from t2s_nl import data as data_module
 from t2s_nl import inspection
 from t2s_nl.activity import ActivityEmitter, ActivityListener
+from t2s_nl.clients import NO_MODEL_AVAILABLE
 from t2s_nl.correctives import compose_session_summary
 from t2s_nl.intents import Directive, Intent, Plan
-from t2s_nl.router import RouterContext, route
+from t2s_nl.offline_router import OFFLINE_ROUTING_NOTE
+from t2s_nl.router import RouterContext, no_model_reason, route
 from t2s_nl.store import Store
 from t2s_nl.turns import DataTable, Turn
 
-__all__ = ["HELP_TEXT", "MAX_REJECTION_NOTES", "Orchestrator"]
+__all__ = [
+    "GENERATION_NEEDS_A_MODEL",
+    "HELP_TEXT",
+    "MAX_REJECTION_NOTES",
+    "Orchestrator",
+]
+
+#: Backstop for the one boundary this package will not cross: a directive that
+#: got as far as a generation call with no model behind it. The keyword router
+#: refuses ``query``/``create_schema``/``corrective`` before they ever run, so
+#: this is reached by ``load_data`` (whose rows come from the model) and by any
+#: future path that reaches ``t2s_core`` without one. It is an explanation, not
+#: an attempt: no SQL, no DDL and no rows are ever synthesised here.
+GENERATION_NEEDS_A_MODEL = (
+    "That step needs the language model to write something, and {reason}. "
+    "I will not fabricate SQL, DDL or sample data. Set FIREWORKS_API_KEY (or "
+    "put the key in ~/.fireworks-key) and run without T2S_OFFLINE, or capture a fixture "
+    "for this step. Everything that reads your own saved objects still works — /state, "
+    "/models, /dbs, /schema, /rows, /queries, /log."
+)
 
 #: How many per-row validation rejections to show before summarising the rest.
 MAX_REJECTION_NOTES = 10
@@ -193,9 +214,19 @@ class Orchestrator:
                     request_id=response.request_id,
                 ),
             )
-            step.note(directives=list(plan.intents), confidence=plan.confidence)
+            step.note(
+                directives=list(plan.intents),
+                confidence=plan.confidence,
+                # Provenance in the append-only log, not only on screen: a
+                # transcript has to show which turns the model classified and
+                # which the keyword router did.
+                routed_by=plan.routed_by,
+            )
             if plan.refusal:
-                step.refuse("refused: plan too long")
+                # The refusal's own first sentence, not a guess at which
+                # refusal it was: the log has to distinguish "too many
+                # directives" from "that needs a model I do not have".
+                step.refuse(f"refused: {_first_sentence(plan.refusal)}")
             else:
                 step.summary = _plan_summary(plan)
         return plan
@@ -216,9 +247,11 @@ class Orchestrator:
         exchange away.
         """
         if plan.refusal:
-            # D15's cap. Refused whole -- not truncated to the first N, which
-            # is how a misreading turns into a chain of unintended actions.
+            # D15's cap, and the keyword router's "that needs generation".
+            # Refused whole -- not truncated to the first N, which is how a
+            # misreading turns into a chain of unintended actions.
             refused = Turn.error(plan.refusal, intent="unknown")
+            self._note_routing(plan, refused)
             if on_turn is not None:
                 on_turn(refused)
             return [refused]
@@ -229,6 +262,7 @@ class Orchestrator:
             turn = self.execute(directive, utterance, clarification=plan.clarifying_question)
             turn.plan_position = position + 1
             turn.plan_length = total
+            self._note_routing(plan, turn)
             turns.append(turn)
             if turn.kind != "answer":
                 remaining = total - position - 1
@@ -245,6 +279,21 @@ class Orchestrator:
             if on_turn is not None:
                 on_turn(turn)
         return turns
+
+    @staticmethod
+    def _note_routing(plan: Plan, turn: Turn) -> None:
+        """Make keyword routing visible on every turn it produced.
+
+        Not optional and not a debug flag. The whole justification for the
+        keyword router is that the output space is a small enum; the price of
+        using it is saying so, every time, so nobody reads a keyword match as
+        the model's judgement.
+        """
+        if plan.routed_by != "keyword":
+            return
+        note = plan.routing_note or OFFLINE_ROUTING_NOTE
+        if note not in turn.notes:
+            turn.notes.append(note)
 
     def execute(
         self,
@@ -288,6 +337,14 @@ class Orchestrator:
 
         try:
             return handler()
+        except NO_MODEL_AVAILABLE as exc:
+            # A directive that needs generation, reached with no model behind
+            # it. The refusal is the product: an explanation of what is missing,
+            # never a fabricated answer. See GENERATION_NEEDS_A_MODEL.
+            return Turn.error(
+                GENERATION_NEEDS_A_MODEL.format(reason=no_model_reason(exc)),
+                intent=intent,
+            )
         except (
             security.UnsafeQueryError,
             sample_db.SampleDatabaseError,
@@ -920,11 +977,26 @@ _MISSING_REFERENT: dict[str, str] = {
 }
 
 
+#: Longest refusal fragment to put in an activity summary before truncating.
+_SUMMARY_CHARS = 72
+
+
 def _plan_summary(plan: Plan) -> str:
-    """The one-line description of a plan that goes in its activity row."""
+    """The one-line description of a plan that goes in its activity row.
+
+    Carries the provenance, because a ``/log`` that shows "understood: inspect"
+    for a keyword match and for a model classification alike is a log that
+    cannot answer "who decided that?".
+    """
     if not plan.directives:
         return "no directives"
-    return f"understood: {' → '.join(plan.intents)}"
+    suffix = " (keyword)" if plan.routed_by == "keyword" else ""
+    return f"understood: {' → '.join(plan.intents)}{suffix}"
+
+
+def _first_sentence(text: str) -> str:
+    head = text.strip().split(". ")[0].splitlines()[0]
+    return head if len(head) <= _SUMMARY_CHARS else head[: _SUMMARY_CHARS - 1] + "…"
 
 
 def _from_envelope(result: QueryResult | SchemaResult, *, intent: Intent) -> Turn:

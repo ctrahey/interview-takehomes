@@ -38,6 +38,7 @@ from t2s_cli.render import pretty_sql, render_result_lines
 from t2s_core import (
     FireworksClient,
     FireworksConfig,
+    FixtureNotFound,
     InferenceClient,
     NoOpValidator,
     QueryRequest,
@@ -71,6 +72,24 @@ def _fail(message: str, *, code: int = EXIT_FAILURE) -> NoReturn:
     """A clear one-line error, never a traceback, for an expected condition."""
     click.secho(f"Error: {message}", fg="red", err=True)
     sys.exit(code)
+
+
+def _fail_for_inference(exc: T2SError) -> NoReturn:
+    """An inference failure, said in the user's terms.
+
+    ``--offline`` replays fixtures, and every command in this CLI is a
+    *generation* command -- there is no keyword stand-in for writing SQL, and we
+    do not invent one. So an unrecorded request is a boundary, not a bug, and it
+    is worth saying which. (``t2s-chat``, layer 3, can route without a model
+    because routing is a choice over a small enum; generation never is.)
+    """
+    if isinstance(exc, FixtureNotFound):
+        _fail(
+            "there is no recorded fixture for this exact request, and offline mode will "
+            "not invent SQL or DDL. Run without --offline with FIREWORKS_API_KEY set, or "
+            "try one of the recorded demo questions."
+        )
+    _fail(str(exc))
 
 
 def _read_text_or_fail(path: str, *, what: str) -> str:
@@ -237,7 +256,7 @@ def query(
     try:
         result = generate_query(req, client=client, validator=validator)
     except T2SError as exc:
-        _fail(str(exc))
+        _fail_for_inference(exc)
     finally:
         if isinstance(client, FireworksClient):
             client.close()
@@ -276,7 +295,7 @@ def schema(
     try:
         result = generate_schema(req, client=client)
     except T2SError as exc:
-        _fail(str(exc))
+        _fail_for_inference(exc)
     finally:
         if isinstance(client, FireworksClient):
             client.close()

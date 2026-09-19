@@ -44,6 +44,11 @@ T2S_OFFLINE=1 uv run t2s-chat   # replays recorded fixtures, no network
 uv run t2s-chat --ask "model a bookstore" --ask "/state"   # scripted, for transcripts
 ```
 
+It **starts without a key**. The live client is built on first use, so the REPL
+opens, every deterministic read works, and the credential is explained at the
+moment something actually needs to generate — matching what `t2s_api` has always
+done.
+
 State lives in `~/.t2s/foundation.sqlite3` (`T2S_DB_URL` to override) and sample
 databases in `~/.t2s/sample_dbs` (`T2S_SAMPLE_DB_DIR`). Close the chat, reopen
 it, and the session resumes with its model, schema, database and correctives.
@@ -63,3 +68,27 @@ against what `kimi-k2p7-code` actually said rather than what we hoped it would.
 Change a prompt template or a scripted utterance and the key changes, the test
 fails with `FixtureNotFound`, and the fix is to re-run the capture with a key.
 That friction is deliberate: a prompt change is a behaviour change.
+
+## Offline without a fixture: the keyword router
+
+Fixture coverage of open-ended English is unbounded, so `T2S_OFFLINE=1` alone
+only ever answered the utterances somebody captured. When the recorded client
+has nothing — or there is no key at all — `src/t2s_nl/offline_router.py`
+classifies the utterance with keyword and pattern matching over the *same enum*
+the model fills in. That is tractable only because the output space is small and
+fixed: eight intents, eleven inspect targets.
+
+Three rules, and the third is the design:
+
+1. **Fixtures win.** The recorded client is tried first; the keyword router is
+   reached only on `FixtureNotFound` or a missing key — two conditions a live
+   client with a key and a network cannot produce, which is what makes the
+   fallback structurally unreachable online.
+2. **It says so.** Every turn it routes carries
+   `· offline: routed by keyword, not by the model` (or `no API key: …`), and
+   the activity log records `routed_by` and tags the summary `(keyword)`.
+3. **Deterministic routing, never deterministic generation.** `inspect`, `help`,
+   `execute` and `load_data` end in a deterministic read or action, so routing
+   them is the whole job. `query`, `create_schema` and `corrective` end in text
+   a model must write — those are **refused**, with what would unblock them.
+   No SQL or DDL is ever synthesised without a model.
