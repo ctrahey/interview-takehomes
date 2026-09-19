@@ -215,3 +215,30 @@ backs the metadata store.
 - **Auth is still out of scope** (D2 / design §9) — the container has no
   concept of a user, so anyone who can reach port 8000 has full CRUD and
   (with a key) full layer-2 access.
+
+## Starting clean
+
+```bash
+docker compose down -v                      # drops foundation_meta + sample_dbs
+docker compose --profile postgres down -v   # also drops postgres_data
+```
+
+`-v` is the part that matters: without it the named volumes survive, which is
+usually what you want and occasionally exactly what you do not.
+
+Locally, the equivalent is `uv run t2s reset` (it prints what it will delete and
+asks first; `--yes` skips the prompt).
+
+## After pulling changes
+
+`docker compose up` and `docker compose run` **reuse the existing `t2s:local`
+image** -- they do not rebuild on their own. After anything lands, rebuild:
+
+```bash
+docker compose up --build
+# or
+docker compose build
+```
+
+A container running last week's code while the repo has this week's is a
+confusing way to lose an hour.

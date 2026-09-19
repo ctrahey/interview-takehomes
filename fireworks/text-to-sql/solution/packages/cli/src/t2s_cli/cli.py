@@ -464,6 +464,77 @@ def db_list(as_json: bool) -> None:
         click.echo(f"{entry['database_id']}  {entry['size_bytes']} bytes")
 
 
+def _local_store_path() -> Path | None:
+    """The metadata store, when it is a local file we may delete.
+
+    ``T2S_DB_URL`` can point at Postgres or anywhere else; `reset` refuses to
+    guess what deleting that would mean and leaves it alone.
+    """
+    url = os.environ.get("T2S_DB_URL")
+    if url is None:
+        return Path.home() / ".t2s" / "foundation.sqlite3"
+    if url.startswith("sqlite:///"):
+        return Path(url.removeprefix("sqlite:///"))
+    return None
+
+
+@cli.command("reset")
+@click.option("--yes", is_flag=True, default=False, help="Skip the confirmation prompt.")
+@click.option(
+    "--drop-history",
+    is_flag=True,
+    default=False,
+    help="Also delete the chat's readline history (kept by default).",
+)
+def reset(yes: bool, drop_history: bool) -> None:
+    """Delete all local state: every sample database, and the metadata store.
+
+    Deliberately a command and not something you can ask the chat for. Every
+    other destructive action here is scoped to one object the user named and is
+    described before it happens; "throw all of it away" is an operator action,
+    and putting it behind a sentence a language model has to classify would mean
+    a misclassification could wipe a workspace. The blast radius is the whole
+    point, so it takes an explicit command and an explicit yes.
+
+    The container equivalent is `docker compose down -v`, which drops the same
+    state as named volumes.
+    """
+    directory = managed_directory()
+    databases = sorted(directory.glob("*.sqlite3"))
+    # Honour the same override the store itself uses, so a test (or anyone
+    # pointing T2S_DB_URL elsewhere) resets what they are actually using rather
+    # than a path this command assumed.
+    store_path = _local_store_path()
+    history_path = Path.home() / ".t2s" / "chat_history"
+
+    total_bytes = sum(path.stat().st_size for path in databases if path.exists())
+    if store_path is not None and store_path.exists():
+        total_bytes += store_path.stat().st_size
+
+    if not databases and not (store_path and store_path.exists()):
+        click.echo("Nothing to reset: no sample databases and no metadata store.")
+        return
+
+    click.echo(f"{len(databases)} sample database(s) in {directory}")
+    if store_path is None:
+        click.echo("metadata store: not a local file (T2S_DB_URL points elsewhere); left alone")
+    else:
+        click.echo(f"metadata store: {store_path}{'' if store_path.exists() else ' (absent)'}")
+    click.echo(f"total {total_bytes} bytes")
+    if not drop_history and history_path.exists():
+        click.echo(f"keeping {history_path}")
+    if not yes:
+        click.confirm("Delete all of it?", abort=True)
+
+    for path in databases:
+        path.unlink(missing_ok=True)
+    if store_path is not None:
+        store_path.unlink(missing_ok=True)
+    if drop_history:
+        history_path.unlink(missing_ok=True)
+    click.echo(f"Removed {len(databases)} database(s) and the metadata store.")
+
+
 @db.command("path")
 @click.argument("database_id")
 @click.option("--sql", default=None, help="Print a ready-to-run sqlite3 command for this SQL.")
