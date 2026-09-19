@@ -21,16 +21,39 @@ reports **healthy with no `FIREWORKS_API_KEY` set at all**.
 
 ## Adding a Fireworks key
 
-The key must never be baked into the image or passed as a build arg — it
-only ever arrives as a runtime environment variable. The repo already treats
-`~/.fireworks-key` as opaque data (never sourced, never echoed); do the same
-here:
+The key must never be baked into the image or passed as a build arg. Three
+runtime routes, in order of least copying:
+
+**1. Mount the file you already have (default, nothing to set up).**
+`~/.fireworks-key` is bind-mounted read-only to `/home/t2s/.fireworks-key`,
+which is exactly where the app looks. Nothing is copied, nothing lands in your
+shell environment, and nothing lands in `.env`:
 
 ```bash
 cd solution
-printf 'FIREWORKS_API_KEY=%s\n' "$(cat ~/.fireworks-key)" >> .env   # .env is gitignored
-docker compose up --build
+docker compose up --build          # the key file comes along
+docker compose run --rm chat
 ```
+
+If the host file does not exist, Docker materialises an empty directory at that
+path; `read_api_key()` checks `is_file()` and treats that as "no key", so a
+keyless machine still starts cleanly rather than crashing.
+
+**2. Forward it from your shell**, if you keep it somewhere else:
+
+```bash
+FIREWORKS_API_KEY="$(cat ~/.fireworks-key)" docker compose run --rm chat
+```
+
+**3. Put it in `.env`** (gitignored, and excluded from the build context):
+
+```bash
+printf 'FIREWORKS_API_KEY=%s\n' "$(cat ~/.fireworks-key)" >> .env
+```
+
+Note the host's `~/.fireworks-key` is *not* otherwise visible inside a
+container, so the error message there names the routes above rather than
+telling you to create a file the container cannot see.
 
 Now `/text-to-sql/query` and `/text-to-sql/schema` make live calls. `T2S_MODEL`
 / `T2S_MODEL_ALT` in the same `.env` (see `.env.example`) select the model.

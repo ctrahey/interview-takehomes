@@ -144,8 +144,24 @@ def read_api_key() -> str:
     if env:
         return env.strip()
     path = Path.home() / ".fireworks-key"
-    if path.exists():
-        return path.read_text(encoding="utf-8").strip()
+    # is_file(), not exists(): a compose bind mount whose host source is missing
+    # materialises as an empty *directory* at this path, and read_text() on a
+    # directory raises IsADirectoryError -- a confusing crash in place of the
+    # clear "no key" message below.
+    if path.is_file():
+        contents = path.read_text(encoding="utf-8").strip()
+        if contents:
+            return contents
+    if Path("/.dockerenv").exists():
+        # Inside a container the host's ~/.fireworks-key is not visible, so
+        # telling someone to create it is advice that cannot work. Name the
+        # thing that actually plumbs a key in.
+        raise RuntimeError(
+            "No Fireworks API key. This is a container, so the host's "
+            "~/.fireworks-key is not visible here -- pass the key in instead: "
+            'FIREWORKS_API_KEY="$(cat ~/.fireworks-key)" docker compose run --rm chat, '
+            "or put it in solution/.env, or set T2S_OFFLINE=1 to replay fixtures."
+        )
     raise RuntimeError(
         "No Fireworks API key. Set FIREWORKS_API_KEY or create ~/.fireworks-key, "
         "or run with T2S_OFFLINE=1 to replay recorded fixtures."
@@ -161,7 +177,7 @@ def api_key_available() -> bool:
     if os.environ.get("FIREWORKS_API_KEY", "").strip():
         return True
     path = Path.home() / ".fireworks-key"
-    return path.exists() and bool(path.read_text(encoding="utf-8").strip())
+    return path.is_file() and bool(path.read_text(encoding="utf-8").strip())
 
 
 class DeferredFireworksClient:

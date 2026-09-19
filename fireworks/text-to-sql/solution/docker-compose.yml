@@ -54,7 +54,19 @@ services:
       # 5173/3000) is already allowed (t2s_api.app.DEFAULT_CORS_ORIGINS).
       # Override here for any other origin.
       T2S_CORS_ORIGINS: ${T2S_CORS_ORIGINS:-}
+      # Forwarded from your shell when set, so `FIREWORKS_API_KEY=$(cat
+      # ~/.fireworks-key) docker compose run chat` just works. Compose only
+      # passes variables it is told about; the host's ~/.fireworks-key is NOT
+      # visible inside the container, so naming the file in an error message
+      # there would be misleading. Empty default keeps a keyless `up` working.
+      FIREWORKS_API_KEY: ${FIREWORKS_API_KEY:-}
     volumes:
+      # Your key file, mounted read-only at the path the app already looks in
+      # ($HOME/.fireworks-key inside the image). This is the file-based route:
+      # no key in your shell environment, no key in .env, no key in the image.
+      # Docker creates an empty directory here if the host file is missing,
+      # which read_api_key() treats as "no key" rather than crashing.
+      - ${T2S_KEY_FILE:-${HOME}/.fireworks-key}:/home/t2s/.fireworks-key:ro
       # Named volume: sample database *files* (D9's managed directory) are
       # real files a user can spend real time creating/loading -- losing
       # them on `docker compose down`/restart would be a bad surprise.
@@ -102,7 +114,20 @@ services:
     environment:
       T2S_DB_URL: ${T2S_DB_URL:-sqlite:////data/foundation/foundation.sqlite3}
       T2S_SAMPLE_DB_DIR: /data/sample_dbs
+      # Forwarded from your shell when set, so `FIREWORKS_API_KEY=$(cat
+      # ~/.fireworks-key) docker compose run chat` just works. Compose only
+      # passes variables it is told about; the host's ~/.fireworks-key is NOT
+      # visible inside the container, so naming the file in an error message
+      # there would be misleading. Empty default keeps a keyless `up` working.
+      FIREWORKS_API_KEY: ${FIREWORKS_API_KEY:-}
+      T2S_OFFLINE: ${T2S_OFFLINE:-}
     volumes:
+      # Your key file, mounted read-only at the path the app already looks in
+      # ($HOME/.fireworks-key inside the image). This is the file-based route:
+      # no key in your shell environment, no key in .env, no key in the image.
+      # Docker creates an empty directory here if the host file is missing,
+      # which read_api_key() treats as "no key" rather than crashing.
+      - ${T2S_KEY_FILE:-${HOME}/.fireworks-key}:/home/t2s/.fireworks-key:ro
       - sample_dbs:/data/sample_dbs
       - foundation_meta:/data/foundation
     stdin_open: true
