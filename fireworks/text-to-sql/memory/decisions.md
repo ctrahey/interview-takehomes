@@ -175,3 +175,70 @@ question now returns a correct query. The corpus already contains the abstention
 **Deferred to phase 2:** persistence per DataModel, provenance, effectiveness tracking,
 auto-promotion of clarification answers into correctives, conflict/precedence resolution beyond a
 simple most-recent-wins ordering.
+
+## D14 — A session is an append-only log of activities, not a mutable blob
+Proposed by Chris 2026-09-19 after using the chat: "things are really quite slow and it's hard to
+know what is going on."
+
+The complaint is observability, not latency. A 7-second wait is tolerable when you can see what it
+is doing; the same wait is intolerable when the terminal is silent. We currently persist session
+*pointers* (current model, current database) — the state, with no record of how it was reached.
+
+**Model.** `Activity` rows appended to a session, never updated. Each is one transition:
+`seq`, `session_id`, `kind` (`router.classify`, `schema.generate`, `data.generate`, `data.load`,
+`query.generate`, `query.repair`, `query.execute`, `corrective.record`), `phase` (`begin` | `end`),
+`status`, `at`, `duration_ms`, `summary`, `detail` (JSON), plus `model`, `tokens`, `request_id`
+where an inference call was involved. Begin and end are separate immutable rows rather than one row
+mutated on completion — that is what makes it a transition log rather than a status table, and it
+means a crashed step leaves evidence instead of a row stuck at "running".
+
+**Ownership.** `foundation` persists it; the orchestrator emits it; surfaces subscribe. The TUI
+shows a live line while a step runs and `/log` for history. The API can expose the same log per
+session later, and the eval harness gets per-phase timings for free — which is the honest fix for
+"p95 includes provider queueing", since we will finally have the breakdown.
+
+**Why it is worth building now:** it is the instrument for every performance claim we make. We have
+been reporting latency without being able to attribute it.
+
+## D15 — One utterance yields an ordered list of directives, not one intent
+Chris, same session: *"there isn't yet any notion of the input query having multiple directives in
+it... we need a model where it is arbitrary how many directives are derived from a prompt."*
+
+This is `prompts/MAIN.md`'s own "Interpretations of Natural Language speech-acts" section — the one
+that asks for "a structured list of atomic interpretations" and trails off at a blank item 4. The
+single-intent router was a phase-1 simplification; this restores the original design.
+
+**Model.** The router returns a `Plan`: an ordered list of `Directive`s, each with an intent, its
+parameters, and a referent slot. The orchestrator executes them in turn, appending activities per
+directive (D14), rendering each result as it completes, and halting on failure with the completed
+prefix still shown. A single-directive plan is the common case and must stay exactly as fast.
+
+**What this fixes, in Chris's words:**
+- *"Show me the query for X and sample results"* → `[query, execute]`. Today the second half is
+  silently dropped.
+- *"populate sample data and then show me a query for..."* → `[load_data, query]`, the utterance
+  that truncated the router.
+- *"Awesome — what's the SQL for that?"* → a directive whose referent is the previous activity's
+  output. Referent resolution is a directive-level concern, which is why Chris's "scratch that" was
+  the right instinct: continuity is not a separate feature, it is what a directive needs to name
+  what it operates on.
+
+**Constraints.** Cap the plan length and require each directive to be individually refusable — a
+plan is a bigger blast radius than an intent, and a malicious or confused utterance must not become
+a long chain of actions. Every directive passes the same D9 gate it would have as a lone intent.
+
+## D16 — Reasoning is off for transcription, on for problem-solving
+Measured twice, both times decisive: the router (971→0 reasoning tokens, 19x cheaper) and sample
+data generation (**23.1s → 7.0s**, a 3.3x speedup on a 4-table schema).
+
+Both are tasks where the model transcribes a structure we already validate, rather than solving a
+problem. Reasoning expands to fill `max_tokens`, so a generous budget actively costs wall-clock.
+
+Query and schema *generation* keep reasoning: writing correct SQL against an unfamiliar schema is
+exactly the deliberation we are paying for. The rule is not "reasoning is waste" — it is
+"reasoning is waste when the output is determined by the input".
+
+Follow-on worth doing later: data generation should ask the model for a small *vocabulary* of
+realistic values per column and expand deterministically in code, rather than generating every row
+through the model. LLM for semantics, code for volume — and it makes seeds genuinely reproducible
+rather than nominally so.

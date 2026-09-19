@@ -130,6 +130,12 @@ def generate_rows(
             schema_name=DATA_SCHEMA_NAME,
             max_tokens=DATA_MAX_TOKENS,
             temperature=0.0,
+            # Measured 23.1s -> 7.0s on a 4-table schema at 8 rows/table.
+            # DATA_MAX_TOKENS is 8000 and reasoning expands to fill whatever
+            # budget it is given, so most of that wall-clock was deliberation
+            # about a task that is transcription, not problem-solving: emit
+            # rows that satisfy a schema we already validate afterwards.
+            reasoning_effort="none",
         )
     except T2SError as exc:
         raise DataGenerationError(str(exc)) from exc
