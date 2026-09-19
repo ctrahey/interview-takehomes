@@ -15,7 +15,12 @@ from nl_doubles import ScriptedClient, router_payload
 
 from t2s_core.errors import UpstreamError
 from t2s_core.ports import InferenceResponse
-from t2s_nl.intents import INTENTS, ROUTER_SCHEMA, decision_from_payload
+from t2s_nl.intents import (
+    INTENTS,
+    MAX_PLAN_DIRECTIVES,
+    PLAN_SCHEMA,
+    plan_from_payload,
+)
 from t2s_nl.router import RouterContext, route
 
 
@@ -38,10 +43,15 @@ class _FailingClient:
         raise UpstreamError("503 from upstream")
 
 
-def test_the_wire_schema_pins_the_enum() -> None:
-    assert ROUTER_SCHEMA["properties"]["intent"]["enum"] == list(INTENTS)
-    assert ROUTER_SCHEMA["additionalProperties"] is False
-    assert set(ROUTER_SCHEMA["required"]) == set(ROUTER_SCHEMA["properties"])
+def test_the_wire_schema_pins_the_enum_and_the_plan_cap() -> None:
+    directive = PLAN_SCHEMA["properties"]["directives"]["items"]
+    assert directive["properties"]["intent"]["enum"] == list(INTENTS)
+    assert directive["additionalProperties"] is False
+    assert set(directive["required"]) == set(directive["properties"])
+    assert PLAN_SCHEMA["additionalProperties"] is False
+    assert set(PLAN_SCHEMA["required"]) == set(PLAN_SCHEMA["properties"])
+    # The cap is stated on the wire as well as enforced on arrival (D15).
+    assert PLAN_SCHEMA["properties"]["directives"]["maxItems"] == MAX_PLAN_DIRECTIVES
 
 
 @pytest.mark.parametrize(
@@ -50,37 +60,41 @@ def test_the_wire_schema_pins_the_enum() -> None:
         '{"response_class": "valid", "query": "SELECT',  # truncated mid-string
         "not json at all",
         "[]",
-        '{"intent": "DEFINITELY_NOT_AN_INTENT", "confidence": "high"}',
+        '{"directives": [{"intent": "DEFINITELY_NOT_AN_INTENT"}], "confidence": "high"}',
         '{"confidence": "high"}',
+        '{"directives": [], "confidence": "high"}',
     ],
 )
 def test_unusable_router_output_becomes_a_question(content: str) -> None:
-    decision = route("do something", client=_RawClient(content), context=RouterContext())
-    assert decision.intent == "unknown"
-    assert decision.clarifying_question
+    plan = route("do something", client=_RawClient(content), context=RouterContext())
+    assert plan.intents == ("unknown",)
+    assert plan.clarifying_question
 
 
 def test_a_valid_intent_with_broken_parameters_keeps_the_intent() -> None:
     payload = router_payload("query", text="how many?")
-    payload["parameters"] = {"row_count": "not a number", "inspect_target": 17}
-    decision = decision_from_payload(json.dumps(payload))
-    assert decision.intent == "query"
-    assert decision.confidence == "low"
-    assert decision.parameters.row_count is None
+    payload["directives"][0]["parameters"] = {  # type: ignore[index]
+        "row_count": "not a number",
+        "inspect_target": 17,
+    }
+    plan = plan_from_payload(json.dumps(payload))
+    assert plan.primary.intent == "query"
+    assert plan.confidence == "low"
+    assert plan.primary.parameters.row_count is None
 
 
 def test_an_out_of_range_row_count_is_discarded_not_honoured() -> None:
     payload = router_payload("load_data", row_count=999_999_999)
-    decision = decision_from_payload(json.dumps(payload))
-    assert decision.intent == "load_data"
-    assert decision.parameters.row_count is None
+    plan = plan_from_payload(json.dumps(payload))
+    assert plan.primary.intent == "load_data"
+    assert plan.primary.parameters.row_count is None
 
 
 def test_transport_failure_is_a_question_not_a_traceback() -> None:
-    decision = route("anything", client=_FailingClient(), context=RouterContext())
-    assert decision.intent == "unknown"
-    assert "503" in (decision.clarifying_question or "")
-    assert "/state" in (decision.clarifying_question or "")
+    plan = route("anything", client=_FailingClient(), context=RouterContext())
+    assert plan.intents == ("unknown",)
+    assert "503" in (plan.clarifying_question or "")
+    assert "/state" in (plan.clarifying_question or "")
 
 
 def test_the_router_is_told_what_exists_but_not_what_is_in_it() -> None:
@@ -114,10 +128,10 @@ def test_an_irrelevant_bad_parameter_does_not_cost_us_the_good_ones() -> None:
     the one field that turn actually needed.
     """
     payload = router_payload("create_schema", text="a small bookstore")
-    payload["parameters"]["row_count"] = 0  # type: ignore[index]
-    decision = decision_from_payload(json.dumps(payload))
+    payload["directives"][0]["parameters"]["row_count"] = 0  # type: ignore[index]
+    plan = plan_from_payload(json.dumps(payload))
 
-    assert decision.intent == "create_schema"
-    assert decision.parameters.text == "a small bookstore"
-    assert decision.parameters.row_count is None
-    assert decision.confidence == "low", "pruning is a degradation and must say so"
+    assert plan.primary.intent == "create_schema"
+    assert plan.primary.parameters.text == "a small bookstore"
+    assert plan.primary.parameters.row_count is None
+    assert plan.confidence == "low", "pruning is a degradation and must say so"

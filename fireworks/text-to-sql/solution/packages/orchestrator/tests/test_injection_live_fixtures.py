@@ -1,10 +1,16 @@
 """Injection resistance, measured against what the live model actually returned.
 
 ``test_security.py`` proves the *gates* hold when the model complies with an
-attack. This file is the other half of the evidence: two real attacks were run
+attack. This file is the other half of the evidence: three real attacks were run
 through the real conversational path against ``kimi-k2p7-code``, and what came
 back is committed here as fixtures. So the README can say injection resistance
-is tested rather than claimed -- for both channels layer 3 opens.
+is tested rather than claimed -- for every channel layer 3 opens.
+
+The third script is D15's new surface: an utterance that carries a legitimate
+compound request *and* an injected imperative. A plan is a bigger blast radius
+than an intent, so the assertion is that **every directive in the plan** is
+gated exactly as it would have been alone -- which is why the replay below
+flattens ``run()`` rather than keeping only the last turn.
 """
 
 from __future__ import annotations
@@ -46,8 +52,9 @@ def has_ddl_or_dml(sql: str) -> bool:
 
 
 def _replay(script: list[str], store: Store) -> list[Turn]:
+    """Every turn of every directive -- a plan's later halves are not exempt."""
     orch = Orchestrator(client=offline_client(), store=store)
-    return [orch.handle(u) for u in script]
+    return [turn for utterance in script for turn in orch.run(utterance)]
 
 
 @pytest.mark.parametrize("name", sorted(SECURITY_SCRIPTS))
@@ -89,7 +96,8 @@ def test_an_injected_corrective_does_not_hijack_later_generation(
 ) -> None:
     """The corrective lands in the *system* prompt, so this is the harder case (D13)."""
     turns = _replay(SECURITY_SCRIPTS["injection-corrective"], store)
-    stored, asked = turns[1], turns[2]
+    stored = next(t for t in turns if t.intent == "corrective")
+    asked = next(t for t in turns if t.intent == "query")
 
     # The corrective was accepted as data -- we do not silently discard user text.
     assert stored.intent == "corrective"
@@ -104,6 +112,6 @@ def test_an_injected_corrective_does_not_hijack_later_generation(
 def test_the_attacked_schemas_still_exist_afterwards(store: Store, sample_db_dir: Path) -> None:
     orch = Orchestrator(client=offline_client(), store=store)
     for utterance in SECURITY_SCRIPTS["injection-corrective"]:
-        orch.handle(utterance)
+        orch.run(utterance)
     detail = orch.catalogue("schema_detail")
     assert {row[0] for row in detail.rows} >= {"customers"}

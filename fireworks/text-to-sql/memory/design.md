@@ -104,6 +104,15 @@ Sample database lifecycle — `create(schema) → load(dataset) → query(sql) �
 a managed directory; client-supplied paths never reach the filesystem (D9). Every `query` runs
 read-only, timed out, and row-capped.
 
+Two conversational tables were added for layer 3. `SessionState` holds the durable "where am I"
+pointers. `Activity` (D14) is the **append-only transition log**: one row per `(step, phase)`,
+`phase ∈ {begin, end}`, ordered by a per-session `seq`, carrying `status`, `duration_ms`, a
+`summary`, a JSON `detail`, and `model`/`tokens`/`request_id` when inference was involved.
+`ActivityRepository` exposes `append` and readers and **no mutation path at all** — that is the
+invariant, and it is what makes an interrupted step legible as a `begin` with no `end` rather than
+a status row stuck at "running". It is also, since D15, how a directive's referent resolves: "the
+SQL for that" is the latest successful `query.generate` row, not a model call.
+
 ## 5. `api` — FastAPI
 
 **Layer 1, deterministic CRUD (zero natural language):** projects, sessions, models, model versions,

@@ -25,7 +25,7 @@ from typing import Any
 from t2s_core.models import Usage
 from t2s_core.ports import InferenceClient, InferenceResponse, Message
 from t2s_nl.data import DATA_SCHEMA_NAME
-from t2s_nl.intents import ROUTER_SCHEMA_NAME
+from t2s_nl.intents import PLAN_SCHEMA_NAME
 
 
 @dataclass
@@ -63,7 +63,7 @@ class ScriptedClient:
         reasoning_effort: str | None = None,
     ) -> InferenceResponse:
         self.calls.append(Call(list(messages), schema_name))
-        if schema_name == ROUTER_SCHEMA_NAME:
+        if schema_name == PLAN_SCHEMA_NAME:
             payload = self._next(self.router, "router")
         elif schema_name == DATA_SCHEMA_NAME:
             payload = self._next(self.data, "sample data")
@@ -110,13 +110,56 @@ class TripwireClient:
         reasoning_effort: str | None = None,
     ) -> InferenceResponse:
         self.calls.append(Call(list(messages), schema_name))
+        # reasoning_effort MUST be forwarded: it is part of the fixture key, so
+        # a wrapper that accepts it and drops it turns every replay into a
+        # FixtureNotFound that looks like a prompt regression.
         return self.inner.complete(
             messages,
             response_schema=response_schema,
             schema_name=schema_name,
             max_tokens=max_tokens,
             temperature=temperature,
+            reasoning_effort=reasoning_effort,
         )
+
+
+def directive_payload(
+    intent: str,
+    *,
+    inspect_target: str = "unspecified",
+    table: str | None = None,
+    text: str | None = None,
+    row_count: int | None = None,
+    referent: str = "none",
+    rationale: str = "test",
+) -> dict[str, Any]:
+    """One directive, wire-shaped (D15)."""
+    return {
+        "intent": intent,
+        "parameters": {
+            "inspect_target": inspect_target,
+            "table": table,
+            "model_ref": None,
+            "row_count": row_count,
+            "seed": None,
+            "text": text,
+        },
+        "referent": referent,
+        "rationale": rationale,
+    }
+
+
+def plan_payload(
+    *directives: dict[str, Any],
+    confidence: str = "high",
+    clarifying_question: str | None = None,
+) -> dict[str, Any]:
+    """A whole router response: an ordered list of directives (D15)."""
+    return {
+        "directives": list(directives),
+        "confidence": confidence,
+        "clarifying_question": clarifying_question,
+    }
 
 
 def router_payload(
@@ -126,23 +169,24 @@ def router_payload(
     table: str | None = None,
     text: str | None = None,
     row_count: int | None = None,
+    referent: str = "none",
     rationale: str = "test",
     clarifying_question: str | None = None,
 ) -> dict[str, Any]:
-    return {
-        "intent": intent,
-        "confidence": "high",
-        "parameters": {
-            "inspect_target": inspect_target,
-            "table": table,
-            "model_ref": None,
-            "row_count": row_count,
-            "seed": None,
-            "text": text,
-        },
-        "clarifying_question": clarifying_question,
-        "rationale": rationale,
-    }
+    """A one-directive plan -- the common case, kept terse for the many tests
+    that care about a single intent and nothing about plans."""
+    return plan_payload(
+        directive_payload(
+            intent,
+            inspect_target=inspect_target,
+            table=table,
+            text=text,
+            row_count=row_count,
+            referent=referent,
+            rationale=rationale,
+        ),
+        clarifying_question=clarifying_question,
+    )
 
 
 def envelope_payload(

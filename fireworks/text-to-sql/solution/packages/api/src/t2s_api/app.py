@@ -12,7 +12,10 @@ request gets whatever was wired here.
 
 from __future__ import annotations
 
+import os
+
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import Engine
 
 from foundation.db import init_db, make_session_factory
@@ -30,6 +33,36 @@ from t2s_api.routers import (
 from t2s_core.ports import InferenceClient, QueryValidator, SchemaValidator
 
 __all__ = ["app", "create_app"]
+
+
+#: Browser origins allowed to call this API. Defaults to the usual local dev
+#: servers so a Vue/Vite UI works out of the box; override with a
+#: comma-separated ``T2S_CORS_ORIGINS``. Deliberately NOT ``*``: this API can
+#: create and query databases, and a wildcard default is the kind of thing that
+#: survives all the way to a deployment nobody re-read.
+DEFAULT_CORS_ORIGINS = (
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+)
+
+
+def _cors_origins() -> list[str]:
+    configured = os.environ.get("T2S_CORS_ORIGINS")
+    if not configured:
+        return list(DEFAULT_CORS_ORIGINS)
+    return [origin.strip() for origin in configured.split(",") if origin.strip()]
+
+
+def _install_cors(app: FastAPI) -> None:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins(),
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=["*"],
+    )
 
 
 def create_app(
@@ -58,6 +91,8 @@ def create_app(
             "See memory/design.md §5."
         ),
     )
+
+    _install_cors(app)
 
     resolved_engine = engine or default_engine()
     init_db(resolved_engine)

@@ -162,7 +162,7 @@ def test_query_without_a_schema_asks_instead_of_guessing(store: Store) -> None:
     assert turn.kind == "clarification_needed"
     assert "schema" in turn.text.lower()
     # It never reached the generation call: only the router was consulted.
-    assert [c.schema_name for c in client.calls] == ["t2s_intent"]
+    assert [c.schema_name for c in client.calls] == ["t2s_plan"]
 
 
 def test_execute_without_a_database_asks_instead_of_failing(store: Store) -> None:

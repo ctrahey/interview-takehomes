@@ -18,10 +18,16 @@ import uuid
 from pathlib import Path
 
 import pytest
-from nl_doubles import ExplodingClient, ScriptedClient, envelope_payload, router_payload
+from nl_doubles import (
+    ExplodingClient,
+    ScriptedClient,
+    directive_payload,
+    envelope_payload,
+    router_payload,
+)
 
 from t2s_nl import inspection
-from t2s_nl.intents import IntentDecision
+from t2s_nl.intents import Directive
 from t2s_nl.orchestrator import Orchestrator
 from t2s_nl.store import Store
 
@@ -122,7 +128,7 @@ def test_the_model_is_asked_exactly_once_and_told_nothing_it_could_parrot(
     turn = orch.handle("show me my databases")
     inspect_calls = client.calls[before:]
 
-    assert [c.schema_name for c in inspect_calls] == ["t2s_intent"], (
+    assert [c.schema_name for c in inspect_calls] == ["t2s_plan"], (
         "an inspect turn is one routing call and then deterministic code"
     )
     sent = inspect_calls[0].text
@@ -148,11 +154,11 @@ def test_state_answers_survive_the_model_being_taken_away(
     orch = Orchestrator(client=client, store=store)
     orch.handle("a tiny shop")
 
-    decision = IntentDecision.model_validate(
-        router_payload("inspect", inspect_target="schema_detail")
+    directive = Directive.model_validate(
+        directive_payload("inspect", inspect_target="schema_detail")
     )
     orch.client = ExplodingClient()
-    turn = orch.execute(decision, "what's my current schema")
+    turn = orch.execute(directive, "what's my current schema")
 
     assert turn.deterministic_answer is True
     assert turn.table is not None
@@ -160,7 +166,7 @@ def test_state_answers_survive_the_model_being_taken_away(
 
     # ...and the exploding client really does explode, so the test has teeth.
     with pytest.raises(AssertionError):
-        orch.client.complete([], response_schema={}, schema_name="t2s_intent")
+        orch.client.complete([], response_schema={}, schema_name="t2s_plan")
 
 
 def test_slash_commands_never_call_a_model(store: Store, sample_db_dir: Path) -> None:

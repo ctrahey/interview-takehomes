@@ -119,7 +119,9 @@ def test_the_chat_never_raises_for_an_expected_condition(store: Store) -> None:
             raise RuntimeError("kaboom")
 
     orch = Orchestrator(client=Boom(), store=store)
-    turn = _safely(orch, "anything")
+    turns = _safely(orch, "anything")
+    assert len(turns) == 1
+    turn = turns[0]
     assert turn.kind == "error"
     assert "kaboom" in turn.text
     assert "session is intact" in turn.text

@@ -17,12 +17,13 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session as OrmSession
 
 from foundation.bootstrap import get_or_create_default_project, get_or_create_default_session
 from foundation.graph import EntityGraph
 from foundation.models import (
+    Activity,
     Corrective,
     Database,
     DatabaseStatus,
@@ -375,3 +376,127 @@ class CorrectiveRepository:
             raise ValueError(f"no corrective with id {corrective_id}")
         row.active = False
         self.db.flush()
+
+
+class ActivityRepository:
+    """The append-only session activity log (D14).
+
+    **This class deliberately has no update and no delete.** That is the
+    invariant, not an oversight: an activity row records that a transition
+    happened at a moment, and a record of the past that can be rewritten is not
+    a record. A step that completes is a *second* row (`phase="end"`), which is
+    also what makes a crashed step legible -- its `begin` stands alone with no
+    `end`, instead of a mutable row stuck forever at "running".
+
+    `seq` is allocated per session as ``max(seq) + 1`` inside the caller's
+    transaction. One conversation is one writer, so this is not a contended
+    allocation; the unique constraint on ``(session_id, seq)`` turns the
+    concurrent case into a loud integrity error rather than a silently
+    reordered log.
+    """
+
+    #: Phases and statuses, named here so callers and tests agree on spelling.
+    BEGIN = "begin"
+    END = "end"
+    RUNNING = "running"
+    OK = "ok"
+    ERROR = "error"
+    REFUSED = "refused"
+
+    def __init__(self, db: OrmSession) -> None:
+        self.db = db
+
+    def next_seq(self, session_id: uuid.UUID) -> int:
+        current = self.db.execute(
+            select(func.max(Activity.seq)).where(Activity.session_id == session_id)
+        ).scalar_one_or_none()
+        return int(current or 0) + 1
+
+    def append(
+        self,
+        session_id: uuid.UUID,
+        *,
+        kind: str,
+        phase: str,
+        status: str = RUNNING,
+        summary: str | None = None,
+        detail: dict[str, Any] | None = None,
+        duration_ms: int | None = None,
+        model: str | None = None,
+        tokens: int | None = None,
+        request_id: str | None = None,
+        at: datetime | None = None,
+    ) -> Activity:
+        if phase not in (self.BEGIN, self.END):
+            raise ValueError(f"phase must be 'begin' or 'end', not {phase!r}")
+        row = Activity(
+            session_id=session_id,
+            seq=self.next_seq(session_id),
+            kind=kind,
+            phase=phase,
+            status=status,
+            at=at or datetime.now(UTC),
+            duration_ms=duration_ms,
+            summary=summary,
+            detail=detail,
+            model=model,
+            tokens=tokens,
+            request_id=request_id,
+        )
+        self.db.add(row)
+        self.db.flush()
+        return row
+
+    def list_for_session(
+        self, session_id: uuid.UUID, *, limit: int | None = None
+    ) -> list[Activity]:
+        """The log in `seq` order. ``limit`` returns the most recent N, still ordered."""
+        stmt = select(Activity).where(Activity.session_id == session_id)
+        if limit is None:
+            return list(self.db.execute(stmt.order_by(Activity.seq)).scalars())
+        tail = list(self.db.execute(stmt.order_by(Activity.seq.desc()).limit(limit)).scalars())
+        return list(reversed(tail))
+
+    def latest(
+        self,
+        session_id: uuid.UUID,
+        *,
+        kind: str,
+        phase: str = END,
+        status: str | None = OK,
+    ) -> Activity | None:
+        """The most recent activity of one kind -- how a referent is resolved (D15).
+
+        "what's the SQL for *that*?" is answered by the last successful
+        ``query.generate`` end-row, read out of this table. No model is asked
+        what "that" referred to, because the log already knows.
+        """
+        stmt = select(Activity).where(Activity.session_id == session_id, Activity.kind == kind)
+        if phase is not None:
+            stmt = stmt.where(Activity.phase == phase)
+        if status is not None:
+            stmt = stmt.where(Activity.status == status)
+        return self.db.execute(stmt.order_by(Activity.seq.desc()).limit(1)).scalar_one_or_none()
+
+    def unfinished(self, session_id: uuid.UUID) -> list[Activity]:
+        """`begin` rows with no matching `end` -- steps that never completed.
+
+        A crashed process leaves exactly this. It is the reason the log is two
+        rows per step: there is no equivalent question to ask of a status table
+        whose "running" row was never updated.
+        """
+        by_kind: dict[str, list[Activity]] = {}
+        for row in self.list_for_session(session_id):
+            by_kind.setdefault(row.kind, []).append(row)
+        open_rows: list[Activity] = []
+        for group in by_kind.values():
+            # Steps of one kind nest at most by recursion we do not do, so
+            # first-in/first-out pairing within a kind is exact.
+            pending: list[Activity] = []
+            for row in group:
+                if row.phase == self.BEGIN:
+                    pending.append(row)
+                elif pending:
+                    pending.pop(0)
+            open_rows.extend(pending)
+        return sorted(open_rows, key=lambda r: r.seq)

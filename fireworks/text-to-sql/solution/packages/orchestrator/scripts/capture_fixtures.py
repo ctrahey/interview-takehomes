@@ -92,18 +92,32 @@ def _live_client(fixture_dir: Path) -> CachingRecorder:
     return CachingRecorder(fixture_dir)
 
 
-def capture_router(client: CachingRecorder) -> None:
+def capture_router(client: CachingRecorder) -> int:
+    """Replay/record every router case and report how many disagree.
+
+    The DIFF count is the D16 check after a schema change: if the plan-shaped
+    response makes ``reasoning_effort="none"`` misclassify, it shows up here as
+    a number, at capture time, rather than as a mystery in CI.
+    """
     print(f"router: {len(ROUTER_CASES)} utterances")
+    diffs = 0
     for utterance, context_name, expected in ROUTER_CASES:
         context = LOADED_CONTEXT if context_name == "loaded" else RouterContext()
-        decision = route(utterance, client=client, context=context)
-        flag = "ok " if decision.intent == expected else "DIFF"
-        target = decision.parameters.inspect_target
-        print(
-            f"  {flag} {utterance[:52]:<54} -> {decision.intent}"
-            f"{'/' + target if decision.intent == 'inspect' else ''}"
-            f" (wanted {expected})"
+        plan = route(utterance, client=client, context=context)
+        got = plan.intents
+        flag = "ok " if got == expected else "DIFF"
+        diffs += got != expected
+        shown = " → ".join(
+            d.intent
+            + (f"/{d.parameters.inspect_target}" if d.intent == "inspect" else "")
+            + (f"[{d.referent}]" if d.referent != "none" else "")
+            for d in plan.directives
         )
+        print(
+            f"  {flag} {utterance[:52]:<54} -> {shown or '(none)'} (wanted {' → '.join(expected)})"
+        )
+    print(f"  router: {len(ROUTER_CASES) - diffs}/{len(ROUTER_CASES)} matched")
+    return diffs
 
 
 def capture_scenario(client: CachingRecorder, name: str, utterances: list[str]) -> None:
@@ -114,9 +128,12 @@ def capture_scenario(client: CachingRecorder, name: str, utterances: list[str]) 
         store = Store(f"sqlite:///{workdir / 'foundation.sqlite3'}")
         orch = Orchestrator(client=client, store=store)
         for utterance in utterances:
-            turn = orch.handle(utterance)
-            summary = (turn.text or "").split("\n")[0][:72]
-            print(f"  [{turn.kind}/{turn.intent}] {utterance[:44]:<46} {summary}")
+            for turn in orch.run(utterance):
+                summary = (turn.text or "").split("\n")[0][:72]
+                position = (
+                    f" [{turn.plan_position}/{turn.plan_length}]" if turn.plan_length > 1 else ""
+                )
+                print(f"  [{turn.kind}/{turn.intent}]{position} {utterance[:44]:<46} {summary}")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
         os.environ.pop("T2S_SAMPLE_DB_DIR", None)
@@ -131,7 +148,7 @@ def main() -> int:
         print(f"capture: {exc}", file=sys.stderr)
         return 2
 
-    capture_router(client)
+    diffs = capture_router(client)
     capture_scenario(client, "money-path", MONEY_PATH)
     for name, utterances in SECURITY_SCRIPTS.items():
         capture_scenario(client, name, utterances)
@@ -140,6 +157,8 @@ def main() -> int:
         f"\nwrote {len(client.written)} new fixture(s), replayed {client.replayed} "
         f"existing, in {fixture_dir}"
     )
+    if diffs:
+        print(f"WARNING: {diffs} router case(s) disagreed with the expected plan.")
     return 0
 
 

@@ -39,6 +39,7 @@ from foundation.models import (
 )
 from foundation.models import Session as SessionModel
 from foundation.repositories import (
+    ActivityRepository,
     CorrectiveRepository,
     DataModelVersionRepository,
     SessionStateRepository,
@@ -46,7 +47,9 @@ from foundation.repositories import (
 from t2s_nl.turns import DataTable
 
 __all__ = [
+    "ACTIVITY_LOG_LIMIT",
     "SAMPLE_ROW_CAP",
+    "activity_log",
     "list_correctives",
     "list_databases",
     "list_models",
@@ -59,6 +62,11 @@ __all__ = [
 ]
 
 SAMPLE_ROW_CAP = 20
+
+#: How many activity rows ``/log`` shows by default. The log is append-only and
+#: grows for the life of a session, so the default is a tail, not the whole
+#: thing; ``/log 200`` asks for more.
+ACTIVITY_LOG_LIMIT = 30
 
 
 def _short(value: uuid.UUID | None) -> str:
@@ -367,3 +375,43 @@ def state_summary(db: OrmSession, session_id: uuid.UUID) -> DataTable:
         ["correctives", str(len(correctives))],
     ]
     return DataTable(columns=["", ""], rows=rows, caption="current session state")
+
+
+def activity_log(
+    db: OrmSession, session_id: uuid.UUID, *, limit: int = ACTIVITY_LOG_LIMIT
+) -> DataTable:
+    """The append-only activity log for one session, newest last (D14).
+
+    Rendered here rather than in the chat loop for the same reason every other
+    state answer is: it is a deterministic read, and the surfaces that show it
+    (``/log``, "what have you been doing?") must not be able to disagree.
+
+    A `begin` with no `end` is shown as such -- the "…" status is not a value in
+    the table, it is the *absence* of a second row, which is exactly the
+    evidence a crashed step leaves behind.
+    """
+    rows = ActivityRepository(db).list_for_session(session_id, limit=limit)
+    open_seqs = {r.seq for r in ActivityRepository(db).unfinished(session_id)}
+    out: list[list[str]] = []
+    for row in rows:
+        if row.phase == ActivityRepository.BEGIN:
+            status = "…no end" if row.seq in open_seqs else "begin"
+        else:
+            status = row.status
+        took = f"{row.duration_ms / 1000:.1f}s" if row.duration_ms is not None else "-"
+        out.append(
+            [
+                str(row.seq),
+                row.at.strftime("%H:%M:%S"),
+                row.kind,
+                status,
+                took if row.phase == ActivityRepository.END else "",
+                (row.summary or "")[:60],
+            ]
+        )
+    caption = "nothing has happened in this session yet" if not out else f"{len(out)} activities"
+    return DataTable(
+        columns=["#", "at", "kind", "status", "took", "what"],
+        rows=out,
+        caption=caption,
+    )

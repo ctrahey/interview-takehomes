@@ -28,23 +28,25 @@ def _context(name: str) -> RouterContext:
     ROUTER_CASES,
     ids=[u[:40].replace(" ", "-") for u, _, _ in ROUTER_CASES],
 )
-def test_router_picks_the_right_intent(utterance: str, context_name: str, expected: str) -> None:
-    decision = route(utterance, client=offline_client(), context=_context(context_name))
-    assert decision.intent == expected
+def test_router_picks_the_right_plan(
+    utterance: str, context_name: str, expected: tuple[str, ...]
+) -> None:
+    plan = route(utterance, client=offline_client(), context=_context(context_name))
+    assert plan.intents == expected
 
 
 def test_chris_examples_resolve_to_the_right_deterministic_read() -> None:
     """The two utterances that most tempt a model to answer instead of classify."""
     databases = route("show me my databases", client=offline_client(), context=LOADED_CONTEXT)
-    assert databases.intent == "inspect"
-    assert databases.parameters.inspect_target == "databases"
+    assert databases.primary.intent == "inspect"
+    assert databases.primary.parameters.inspect_target == "databases"
 
     rows = route(
         "show me some sample rows from orders", client=offline_client(), context=LOADED_CONTEXT
     )
-    assert rows.intent == "inspect"
-    assert rows.parameters.inspect_target == "sample_rows"
-    assert (rows.parameters.table or "").lower() == "orders"
+    assert rows.primary.intent == "inspect"
+    assert rows.primary.parameters.inspect_target == "sample_rows"
+    assert (rows.primary.parameters.table or "").lower() == "orders"
 
 
 def test_the_router_extracts_the_payload_alongside_the_intent() -> None:
@@ -53,32 +55,63 @@ def test_the_router_extracts_the_payload_alongside_the_intent() -> None:
         client=offline_client(),
         context=EMPTY_CONTEXT,
     )
-    assert schema.intent == "create_schema"
-    assert "book" in (schema.parameters.text or "").lower()
+    assert schema.primary.intent == "create_schema"
+    assert "book" in (schema.primary.parameters.text or "").lower()
 
     rows = route(
         "fill the database with about 25 rows per table",
         client=offline_client(),
         context=LOADED_CONTEXT,
     )
-    assert rows.intent == "load_data"
-    assert rows.parameters.row_count == 25
+    assert rows.primary.intent == "load_data"
+    assert rows.primary.parameters.row_count == 25
 
     fix = route(
         "actually, revenue is in cents not dollars",
         client=offline_client(),
         context=LOADED_CONTEXT,
     )
-    assert fix.intent == "corrective"
-    assert "cent" in (fix.parameters.text or "").lower()
+    assert fix.primary.intent == "corrective"
+    assert "cent" in (fix.primary.parameters.text or "").lower()
 
 
 def test_nonsense_is_a_question_not_a_guess() -> None:
-    decision = route("purple monkey dishwasher", client=offline_client(), context=EMPTY_CONTEXT)
-    assert decision.intent == "unknown"
-    assert decision.clarifying_question, "an unknown intent must come with something to ask"
+    plan = route("purple monkey dishwasher", client=offline_client(), context=EMPTY_CONTEXT)
+    assert plan.intents == ("unknown",)
+    assert plan.clarifying_question, "an unknown intent must come with something to ask"
 
 
 def test_every_intent_is_exercised_by_the_table() -> None:
-    covered = {expected for _, _, expected in ROUTER_CASES}
+    covered = {intent for _, _, expected in ROUTER_CASES for intent in expected}
     assert covered == set(INTENTS), f"intents with no case: {set(INTENTS) - covered}"
+
+
+def test_the_compound_utterances_that_used_to_be_truncated() -> None:
+    """D15's three examples, in Chris's words, replayed against the live model.
+
+    The first two were silently cut in half by the single-intent router. The
+    third is the one that proves a referent is not an extra step: "what's the
+    SQL for that?" is ONE directive that names prior output.
+    """
+    both = route(
+        "show me the query for unpaid balances and sample results",
+        client=offline_client(),
+        context=LOADED_CONTEXT,
+    )
+    assert both.intents == ("query", "execute")
+
+    ordered = route(
+        "populate sample data and then show me a query for unpaid balances",
+        client=offline_client(),
+        context=LOADED_CONTEXT,
+    )
+    assert ordered.intents == ("load_data", "query")
+
+    referent = route(
+        "Awesome -- what's the SQL for that?",
+        client=offline_client(),
+        context=LOADED_CONTEXT,
+    )
+    assert referent.intents == ("inspect",)
+    assert referent.primary.referent == "last_query"
+    assert referent.primary.referent_kind == "query.generate"

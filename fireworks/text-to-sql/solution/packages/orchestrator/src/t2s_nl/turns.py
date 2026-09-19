@@ -8,6 +8,8 @@ differently without the orchestrator changing.
 ``kind`` has exactly three values, mirroring ``t2s_core``'s response envelope on
 purpose: ``clarification_needed`` and ``error`` are ordinary turns in a
 conversation, not exceptions. The chat loop never sees a traceback for either.
+It is also what halts a multi-directive plan (D15): only an ``answer`` lets the
+next directive run.
 """
 
 from __future__ import annotations
@@ -56,6 +58,12 @@ class Turn:
     #: True when the factual content of this turn came from foundation or a
     #: sample database rather than from an LLM. Asserted in the test suite.
     deterministic_answer: bool = False
+    #: Where this turn sat in its plan (D15), 1-based, and how long the plan
+    #: was. A surface uses these to label "[1/2]" so a two-directive answer
+    #: reads as two answers and not one confusing one. Both default to a plan
+    #: of one, which is the common case and renders exactly as it always did.
+    plan_position: int = 1
+    plan_length: int = 1
 
     @classmethod
     def error(cls, text: str, *, intent: Intent = "unknown", **kwargs: Any) -> Turn:

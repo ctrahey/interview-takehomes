@@ -1,37 +1,51 @@
-"""One LLM call that classifies the utterance and extracts parameters.
+"""One LLM call that turns an utterance into a plan of directives (D15).
 
-One call, not a chain: the router's only job is to pick a branch and fill in
-slots, and everything it picks is then executed by deterministic code. It is
-given a *checklist* of what exists in the session (does a current model exist?
-is a database loaded?) so pronouns resolve -- but never the contents of any of
-it, so there is nothing for it to parrot back as fact.
+**One call, not a chain, and not one call per directive.** The router's only job
+is to cut the utterance into atomic directives, pick each one's branch and fill
+in its slots; everything it picks is then executed by deterministic code. A
+single-directive utterance -- the overwhelmingly common case -- costs exactly
+what it cost before this file learned about plans: one request, one response,
+``reasoning_effort="none"`` (D16). The plan is a shape change in the response
+schema, not an extra round trip.
+
+It is given a *checklist* of what exists in the session (does a current model
+exist? is a database loaded?) so pronouns resolve -- but never the contents of
+any of it, so there is nothing for it to parrot back as fact.
 
 Degradation, per inference-findings: the enum is enforced on the wire (D7) and
 validated again on arrival; a truncated, unparseable or mislabelled answer
-becomes ``unknown`` plus a clarifying question. Transport failure (the API is
-down, the key is wrong) becomes ``unknown`` too, with the exception's message --
-never a traceback into the chat loop.
+becomes a one-directive ``unknown`` plan plus a clarifying question. Transport
+failure (the API is down, the key is wrong) becomes the same, with the
+exception's message -- never a traceback into the chat loop.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from t2s_core.errors import T2SError
-from t2s_core.ports import InferenceClient, Message
-from t2s_nl.intents import ROUTER_SCHEMA, ROUTER_SCHEMA_NAME, IntentDecision, decision_from_payload
+from t2s_core.ports import InferenceClient, InferenceResponse, Message
+from t2s_nl.intents import (
+    MAX_PLAN_DIRECTIVES,
+    PLAN_SCHEMA,
+    PLAN_SCHEMA_NAME,
+    Directive,
+    Plan,
+    plan_from_payload,
+)
 from t2s_nl.prompts import REGISTRY
 
 __all__ = ["ROUTER_MAX_TOKENS", "RouterContext", "route"]
 
 logger = logging.getLogger("t2s_nl.router")
 
-#: The decision is a handful of short fields. Generous enough that finding #1's
-#: truncation trap is not reachable here in practice, small enough to be cheap.
-# Generous because the failure mode is a dead turn, not a cost: with
-# reasoning disabled the router answers in ~110 tokens, so this ceiling is
-# never approached in practice and exists only to bound a pathological reply.
+#: A plan is a handful of short fields per directive, capped at four directives.
+#: Generous because the failure mode is a dead turn, not a cost: with reasoning
+#: disabled the router answers a one-directive utterance in ~130 tokens and a
+#: two-directive one in ~230, so this ceiling is never approached in practice
+#: and exists only to bound a pathological reply.
 ROUTER_MAX_TOKENS = 1500
 
 
@@ -75,11 +89,20 @@ def route(
     *,
     client: InferenceClient,
     context: RouterContext | None = None,
-) -> IntentDecision:
-    """Classify one utterance. Never raises for an expected condition."""
+    on_response: Callable[[InferenceResponse], None] | None = None,
+) -> Plan:
+    """Classify one utterance into a plan. Never raises for an expected condition.
+
+    ``on_response`` receives the raw completion so the caller can attribute the
+    model, token count and request id to its ``router.classify`` activity (D14)
+    without this module importing the activity log.
+    """
     ctx = context or RouterContext()
     messages = [
-        Message("system", REGISTRY.render("router.system")),
+        Message(
+            "system",
+            REGISTRY.render("router.system", max_directives=str(MAX_PLAN_DIRECTIVES)),
+        ),
         Message(
             "user",
             REGISTRY.render(
@@ -92,27 +115,29 @@ def route(
     try:
         response = client.complete(
             messages,
-            response_schema=ROUTER_SCHEMA,
-            schema_name=ROUTER_SCHEMA_NAME,
+            response_schema=PLAN_SCHEMA,
+            schema_name=PLAN_SCHEMA_NAME,
             max_tokens=ROUTER_MAX_TOKENS,
             # Measured: classifying a compound utterance cost ~1970 reasoning
             # tokens and truncated at both 600 and 1200, because reasoning
             # expands to fill the budget it is given. Disabling it answers the
-            # same classification in 111 tokens. This is a routing decision over
-            # a fixed enum, not a problem that benefits from deliberation.
+            # same classification in ~130 tokens. This is a transcription task
+            # over a fixed enum, not a problem that benefits from deliberation
+            # (D16) -- re-verified after the plan schema landed.
             reasoning_effort="none",
             temperature=0.0,
         )
     except T2SError as exc:
         logger.warning("router inference failed: %s", type(exc).__name__)
-        return IntentDecision(
-            intent="unknown",
+        return Plan(
+            directives=[Directive(intent="unknown", rationale="inference unavailable")],
             confidence="low",
             clarifying_question=(
                 f"I could not reach the language model to work out what you meant ({exc}). "
                 "Slash commands like /state, /models and /dbs still work -- they never "
                 "call a model."
             ),
-            rationale="inference unavailable",
         )
-    return decision_from_payload(response.content)
+    if on_response is not None:
+        on_response(response)
+    return plan_from_payload(response.content)

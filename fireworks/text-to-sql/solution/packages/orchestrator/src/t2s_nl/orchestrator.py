@@ -2,11 +2,13 @@
 
 The shape of every turn is the same, and it is the whole thesis:
 
-    utterance → router (ONE llm call, enum-constrained)
-              → deterministic handler
+    utterance → router (ONE llm call, enum-constrained) → Plan[Directive, ...]
+              → for each directive, in order:
                   ├── state questions  → read foundation, render ourselves
                   ├── generation       → t2s_core, gated and repaired
                   └── execution        → foundation's sample database, D9-gated
+              (each directive bracketed by begin/end activity rows, D14;
+               halting on the first non-answer with the prefix still rendered)
 
 The model picks a branch and fills in slots. It never supplies a fact. When the
 user asks "show me my databases", ``inspection.list_databases`` answers out of
@@ -17,16 +19,28 @@ client) and ``t2s_core.generate_*`` (which only ever produces SQL, gated), and
 there is no path by which model output becomes a reported fact.
 
 Everything durable lives in ``foundation``: the project, the session, the data
-models and their versions, the schemas, datasets, databases, queries, and the
-correctives. The "current" pointers live in ``foundation.models.SessionState``,
-so ``t2s-chat`` can be closed and reopened and the pronouns still resolve.
+models and their versions, the schemas, datasets, databases, queries, the
+correctives, and -- since D14 -- the append-only activity log. The "current"
+pointers live in ``foundation.models.SessionState``, so ``t2s-chat`` can be
+closed and reopened and the pronouns still resolve.
+
+Two additions from W13 are worth naming here because they are one mechanism:
+
+* **Every step appends activities** (D14). ``begin`` before the work, ``end``
+  after it, never a mutation. That is what a surface subscribes to in order to
+  draw "⋯ generating sample data  3.4s" instead of leaving the terminal silent.
+* **A directive's referent is resolved out of that log** (D15). "what's the SQL
+  for that?" reads the last successful ``query.generate`` activity. No second
+  model call is made to work out what "that" meant, which is exactly why the
+  activity log and multi-directive plans are one unit of work and not two.
 """
 
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy.orm import Session as OrmSession
 
@@ -53,11 +67,13 @@ from t2s_core import (
     generate_query,
     generate_schema,
 )
+from t2s_core.models import Attempt
 from t2s_core.ports import InferenceClient
 from t2s_nl import data as data_module
 from t2s_nl import inspection
+from t2s_nl.activity import ActivityEmitter, ActivityListener
 from t2s_nl.correctives import compose_session_summary
-from t2s_nl.intents import Intent, IntentDecision
+from t2s_nl.intents import Directive, Intent, Plan
 from t2s_nl.router import RouterContext, route
 from t2s_nl.store import Store
 from t2s_nl.turns import DataTable, Turn
@@ -81,9 +97,15 @@ I am a text-to-SQL workbench you can talk to. What I can do, in the order it usu
   correct me             "actually, price_cents is in cents"
                          → remembered against this model, and used from now on
   ask about your stuff   "show me my databases", "what's my current schema"
+  ask what I'm doing     "what have you been doing?"  → the activity log, with
+                         timings, so a slow turn can be attributed rather than
+                         guessed at
+
+You can ask for more than one thing at once: "load sample data and then show me
+a query for unpaid balances" runs both, in order, and stops if the first fails.
 
 Slash commands are shortcuts for the impatient -- /state /models /dbs /schema
-/sql /run /fix <text> /correctives /help /quit. Everything they do can also be
+/sql /run /log /fix <text> /correctives /help /quit. Everything they do can also be
 said in plain English.
 
 Answers about your own objects are read straight out of the database and
@@ -113,34 +135,138 @@ class Orchestrator:
         store: Store | None = None,
         dialect: str = "sqlite",
         rows_per_table: int = data_module.DEFAULT_ROWS_PER_TABLE,
+        listeners: Sequence[ActivityListener] = (),
     ) -> None:
         self.client = client
         self.store = store or Store()
         self.dialect = dialect
         self.rows_per_table = rows_per_table
+        #: D14. Owned here because the orchestrator is what knows when a step
+        #: starts and stops; surfaces subscribe rather than poll.
+        self.activity = ActivityEmitter(self.store, self.store.session_id, listeners)
 
     # -- public surface ---------------------------------------------------
-    def handle(self, utterance: str) -> Turn:
-        """Route one utterance and execute the resulting intent."""
+    def run(self, utterance: str, on_turn: Callable[[Turn], None] | None = None) -> list[Turn]:
+        """Route one utterance into a plan and execute every directive in it (D15).
+
+        The primary entry point. Returns one :class:`Turn` per directive that
+        ran, in order. ``on_turn`` is called with each turn the moment it
+        completes, so a surface renders the first half of a compound request
+        while the second half is still running -- which is the difference
+        between a plan and a batch.
+        """
         text = utterance.strip()
         if not text:
-            return Turn.ask("Say something and I'll have a go.")
+            turns = [Turn.ask("Say something and I'll have a go.")]
+        else:
+            return self.execute_plan(self.plan(text), text, on_turn=on_turn)
+        if on_turn is not None:
+            for turn in turns:
+                on_turn(turn)
+        return turns
 
-        decision = route(text, client=self.client, context=self._router_context())
-        return self.execute(decision, text)
+    def handle(self, utterance: str) -> Turn:
+        """Run the utterance and return the final turn.
 
-    def execute(self, decision: IntentDecision, utterance: str) -> Turn:
-        """Run an already-routed decision. Split out so tests can drive it directly.
+        A convenience over :meth:`run` for the single-directive case, which is
+        the common one. Nothing is dropped: every directive still executes and
+        every one still appends its activities; this returns the last turn
+        because a caller that asked for one turn wants the outcome.
+        """
+        turns = self.run(utterance)
+        return turns[-1] if turns else Turn.ask("Say something and I'll have a go.")
+
+    def plan(self, utterance: str) -> Plan:
+        """The router call, bracketed by a ``router.classify`` activity (D14)."""
+        with self.activity.step(
+            "router.classify",
+            summary="working out what you meant",
+            detail={"utterance": utterance[:200]},
+        ) as step:
+            plan = route(
+                utterance,
+                client=self.client,
+                context=self._router_context(),
+                on_response=lambda response: step.record_inference(
+                    model=response.model,
+                    tokens=response.usage.total_tokens,
+                    request_id=response.request_id,
+                ),
+            )
+            step.note(directives=list(plan.intents), confidence=plan.confidence)
+            if plan.refusal:
+                step.refuse("refused: plan too long")
+            else:
+                step.summary = _plan_summary(plan)
+        return plan
+
+    def execute_plan(
+        self,
+        plan: Plan,
+        utterance: str,
+        *,
+        on_turn: Callable[[Turn], None] | None = None,
+    ) -> list[Turn]:
+        """Run the directives in order, halting on the first that does not answer.
+
+        Halting is the point of ordering them: "load sample data and then show
+        me a query for unpaid balances" has no useful second half if the first
+        half failed. The turns already produced are returned regardless, so the
+        surface renders the completed prefix rather than throwing the whole
+        exchange away.
+        """
+        if plan.refusal:
+            # D15's cap. Refused whole -- not truncated to the first N, which
+            # is how a misreading turns into a chain of unintended actions.
+            refused = Turn.error(plan.refusal, intent="unknown")
+            if on_turn is not None:
+                on_turn(refused)
+            return [refused]
+
+        turns: list[Turn] = []
+        total = len(plan.directives)
+        for position, directive in enumerate(plan.directives):
+            turn = self.execute(directive, utterance, clarification=plan.clarifying_question)
+            turn.plan_position = position + 1
+            turn.plan_length = total
+            turns.append(turn)
+            if turn.kind != "answer":
+                remaining = total - position - 1
+                if remaining:
+                    turn.notes.append(
+                        f"stopped here; {remaining} further directive(s) in that request "
+                        "were not run"
+                    )
+                # Published *after* the "stopped here" note, so what the user
+                # sees is what the log records.
+                if on_turn is not None:
+                    on_turn(turn)
+                break
+            if on_turn is not None:
+                on_turn(turn)
+        return turns
+
+    def execute(
+        self,
+        directive: Directive,
+        utterance: str,
+        *,
+        clarification: str | None = None,
+    ) -> Turn:
+        """Run one already-routed directive. Split out so tests can drive it directly.
 
         A table, not a chain of ``if``s, so that adding an intent means adding a
         row here and a handler -- and so that the set of things the router can
-        cause is visible in one place.
+        cause is visible in one place. **Every directive passes exactly the gate
+        it would have passed as a lone intent** (D15): there is no bulk path, no
+        "we already checked the first one" shortcut, and a plan is only ever
+        this method called N times.
         """
-        intent: Intent = decision.intent
-        params = decision.parameters
+        intent: Intent = directive.intent
+        params = directive.parameters
         handlers: dict[str, Callable[[], Turn]] = {
             "help": lambda: Turn(intent="help", text=HELP_TEXT, deterministic_answer=True),
-            "inspect": lambda: self._inspect(decision),
+            "inspect": lambda: self._inspect(directive),
             "create_schema": lambda: self._create_schema(
                 params.text or utterance, name=params.model_ref
             ),
@@ -149,12 +275,12 @@ class Orchestrator:
                 rows_per_table=params.row_count or self.rows_per_table,
                 seed=params.seed or data_module.DEFAULT_SEED,
             ),
-            "execute": self._execute_sql,
+            "execute": lambda: self._execute_sql(referent=directive.referent),
             "corrective": lambda: self._corrective(params.text or utterance),
         }
         handler = handlers.get(intent)
         if handler is None:  # "unknown", and anything the enum grows later
-            question = decision.clarifying_question or (
+            question = clarification or (
                 "I'm not sure what you'd like me to do. You can describe a domain to model, "
                 "ask a question of the data, ask about your saved objects, or say /help."
             )
@@ -173,15 +299,76 @@ class Orchestrator:
             return Turn.error(str(exc), intent=intent)
 
     # -- deterministic state reads ---------------------------------------
-    def _inspect(self, decision: IntentDecision) -> Turn:
+    def _inspect(self, directive: Directive) -> Turn:
         """Answer from ``foundation``. The model chose the target and nothing else."""
-        table = self.catalogue(decision.parameters.inspect_target, table=decision.parameters.table)
+        referenced = self._resolve_referent(directive)
+        if referenced is not None:
+            return referenced
+        table = self.catalogue(
+            directive.parameters.inspect_target, table=directive.parameters.table
+        )
         return Turn(
             intent="inspect",
             text=table.caption or "",
             table=table,
             deterministic_answer=True,
         )
+
+    # -- referents (D15, resolved against the D14 log) --------------------
+    def _resolve_referent(self, directive: Directive) -> Turn | None:
+        """Answer "what's the SQL for *that*?" out of the activity log.
+
+        The whole mechanism: a referent names a kind of prior output, and the
+        activity log already holds the last one of every kind. So "that" is a
+        `SELECT ... ORDER BY seq DESC LIMIT 1`, not a second inference call and
+        not a heuristic over the transcript. This is why D14 and D15 are one
+        unit of work -- without the log, resolving a referent means either
+        asking a model what the user meant or keeping a parallel, mutable
+        "last thing" pointer per kind, and both are worse.
+
+        Returns ``None`` when the directive has no referent, so ordinary
+        inspection falls through untouched.
+        """
+        kind = directive.referent_kind
+        if kind is None:
+            return None
+        record = self.activity.latest(kind)
+        if record is None:
+            return Turn.ask(
+                _MISSING_REFERENT[directive.referent],
+                intent="inspect",
+            )
+        detail = dict(record.detail or {})
+        note = f"from activity #{record.seq} ({record.kind}, {record.at:%H:%M:%S})"
+        if kind == "query.generate" and detail.get("sql"):
+            return Turn(
+                intent="inspect",
+                sql=str(detail["sql"]),
+                text=str(detail.get("question") or ""),
+                notes=[note],
+                deterministic_answer=True,
+            )
+        if kind == "schema.generate" and detail.get("ddl"):
+            return Turn(
+                intent="inspect",
+                ddl=str(detail["ddl"]),
+                notes=[note],
+                deterministic_answer=True,
+            )
+        # last_result / last_data: the rows themselves are not kept in the log
+        # (it is a journal, not a result cache), so answer with the summary the
+        # step recorded and point at the deterministic read that has the rows.
+        return Turn(
+            intent="inspect",
+            text=record.summary or record.label,
+            notes=[note],
+            deterministic_answer=True,
+        )
+
+    def activity_table(self, limit: int = inspection.ACTIVITY_LOG_LIMIT) -> DataTable:
+        """The session's activity log, for ``/log`` (D14). No model, ever."""
+        with self.store.scope() as db:
+            return inspection.activity_log(db, self.store.session_id, limit=limit)
 
     def state(self) -> DataTable:
         with self.store.scope() as db:
@@ -203,6 +390,7 @@ class Orchestrator:
                 "queries": lambda: inspection.list_queries(db, self.store.session_id),
                 "sessions": lambda: inspection.list_sessions(db, self.store.project_id),
                 "correctives": lambda: inspection.list_correctives(db, pointers.data_model_id),
+                "activity": lambda: inspection.activity_log(db, self.store.session_id),
                 "schema_detail": lambda: inspection.schema_detail(
                     db, pointers.version_id, table=table
                 ),
@@ -236,14 +424,20 @@ class Orchestrator:
                 "revision of it, so reproduce it in full with their change applied.\n\n"
                 f"```sql\n{existing_ddl}\n```"
             )
-        result = generate_schema(
-            SchemaRequest(
-                description=description,
-                dialect=self.dialect,  # type: ignore[arg-type]
-                session_summary=compose_session_summary(correctives, base=background),
-            ),
-            client=self.client,
-        )
+        with self.activity.step(
+            "schema.generate",
+            summary="designing the schema",
+            detail={"description": description[:200], "iterating": bool(existing_ddl)},
+        ) as step:
+            result = generate_schema(
+                SchemaRequest(
+                    description=description,
+                    dialect=self.dialect,  # type: ignore[arg-type]
+                    session_summary=compose_session_summary(correctives, base=background),
+                ),
+                client=self.client,
+            )
+            self._record_generation(step, result, key="ddl")
         if result.response_class != "valid" or not result.query:
             return _from_envelope(result, intent="create_schema")
 
@@ -298,17 +492,25 @@ class Orchestrator:
                 intent="query",
             )
 
-        result = generate_query(
-            QueryRequest(
-                question=question,
-                schema_ddl=schema_ddl,
-                dialect=self.dialect,  # type: ignore[arg-type]
-                # INTERIM (D13/W9): correctives ride in session_summary. See
-                # t2s_nl.correctives -- one line changes when W9 lands.
-                session_summary=compose_session_summary(correctives),
-            ),
-            client=self.client,
-        )
+        with self.activity.step(
+            "query.generate",
+            summary="writing the SQL",
+            detail={"question": question[:200], "correctives": len(correctives)},
+        ) as step:
+            result = generate_query(
+                QueryRequest(
+                    question=question,
+                    schema_ddl=schema_ddl,
+                    dialect=self.dialect,  # type: ignore[arg-type]
+                    # INTERIM (D13/W9): correctives ride in session_summary. See
+                    # t2s_nl.correctives -- one line changes when W9 lands.
+                    session_summary=compose_session_summary(correctives),
+                ),
+                client=self.client,
+            )
+            self._record_generation(step, result, key="sql")
+            step.note(question=question[:200])
+        self._record_repairs(result.metadata.attempts, model=result.metadata.model)
 
         with self.store.scope() as db:
             pointers = self._pointers(db)
@@ -364,15 +566,25 @@ class Orchestrator:
             database_id = self.create_database()
             notes.append(f"created sample database {str(database_id)[:8]}")
 
-        generated = data_module.generate_rows(
-            schema_ddl,
-            client=self.client,
-            dialect=self.dialect,
-            rows_per_table=rows_per_table,
-            seed=seed,
-            session_summary=compose_session_summary(correctives),
-        )
-        validated = data_module.validate(generated, graph)
+        with self.activity.step(
+            "data.generate",
+            summary="generating sample data",
+            detail={"rows_per_table": rows_per_table, "seed": seed},
+        ) as step:
+            generated = data_module.generate_rows(
+                schema_ddl,
+                client=self.client,
+                dialect=self.dialect,
+                rows_per_table=rows_per_table,
+                seed=seed,
+                session_summary=compose_session_summary(correctives),
+            )
+            validated = data_module.validate(generated, graph)
+            step.note(
+                tables=len(validated.rows),
+                rows=sum(len(r) for r in validated.rows.values()),
+                rejected=len(validated.rejections),
+            )
         if not validated.rows:
             return Turn.error(
                 "None of the generated rows survived validation, so nothing was loaded.",
@@ -380,7 +592,14 @@ class Orchestrator:
                 notes=validated.rejections[:MAX_REJECTION_NOTES],
             )
 
-        inserted = sample_db.load(database_id, validated.rows)
+        with self.activity.step(
+            "data.load",
+            summary="loading sample data",
+            detail={"database": str(database_id)[:8]},
+        ) as load_step:
+            inserted = sample_db.load(database_id, validated.rows)
+            load_step.summary = f"loaded {inserted} rows into {str(database_id)[:8]}"
+            load_step.note(inserted=inserted, tables=sorted(validated.rows))
         with self.store.scope() as db:
             pointers = self._pointers(db)
             DatasetRepository(db).create(
@@ -429,7 +648,20 @@ class Orchestrator:
         return database_id
 
     # -- execution --------------------------------------------------------
-    def _execute_sql(self, sql: str | None = None) -> Turn:
+    def _execute_sql(self, sql: str | None = None, *, referent: str = "none") -> Turn:
+        """Run SQL. With no ``sql``, "that" is resolved -- log first, pointer second.
+
+        Both sources agree in the ordinary case; the log is preferred because it
+        is the thing a referent names (D15), and the session pointer is the
+        fallback for a session that predates the log or whose last query was
+        recorded before this instrumentation existed.
+        """
+        if sql is None and referent in ("none", "last_query"):
+            record = self.activity.latest("query.generate")
+            if record is not None and record.detail:
+                candidate = record.detail.get("sql")
+                if isinstance(candidate, str) and candidate.strip():
+                    sql = candidate
         with self.store.scope() as db:
             pointers = self._pointers(db)
             if sql is None:
@@ -452,7 +684,18 @@ class Orchestrator:
             )
 
         try:
-            result = sample_db.query(database_id, sql)
+            with self.activity.step(
+                "query.execute",
+                summary="running the query",
+                detail={"database": str(database_id)[:8]},
+            ) as step:
+                result = sample_db.query(database_id, sql)
+                step.summary = f"{result.row_count} row(s) returned"
+                step.note(
+                    row_count=result.row_count,
+                    columns=list(result.columns),
+                    truncated=result.truncated,
+                )
         except security.CatalogAccessDeniedError as exc:
             # D12: the refusal is deliberate and points at the answer that IS
             # available deterministically, rather than returning an empty result.
@@ -496,11 +739,14 @@ class Orchestrator:
                     "the domain you want to model first.",
                     intent="corrective",
                 )
-            CorrectiveRepository(db).add(
-                pointers.data_model_id, text, session_id=self.store.session_id
-            )
-            count = len(CorrectiveRepository(db).list_active(pointers.data_model_id))
             last_question = pointers.last_question
+            data_model_id = pointers.data_model_id
+
+        with self.activity.step("corrective.record", summary=f"recording: {text[:80]}") as step:
+            with self.store.scope() as db:
+                CorrectiveRepository(db).add(data_model_id, text, session_id=self.store.session_id)
+                count = len(CorrectiveRepository(db).list_active(data_model_id))
+            step.note(text=text[:400], active_correctives=count)
 
         notes = [f"{count} corrective(s) now apply to this model"]
         if last_question:
@@ -519,6 +765,51 @@ class Orchestrator:
         return self._corrective(text)
 
     # -- internals --------------------------------------------------------
+    def _record_generation(
+        self, step: Any, result: QueryResult | SchemaResult, *, key: str
+    ) -> None:
+        """Attach a generation's provenance and outcome to its activity row."""
+        step.record_inference(
+            model=result.metadata.model, tokens=result.metadata.usage.total_tokens
+        )
+        step.note(
+            response_class=result.response_class,
+            attempts=len(result.metadata.attempts),
+            repairs_used=result.metadata.repairs_used,
+        )
+        if result.response_class == "valid" and result.query:
+            step.note(**{key: result.query})
+        else:
+            step.status = "refused" if result.response_class == "clarification_needed" else "error"
+            step.summary = f"{result.response_class}: {(result.prose or '')[:120]}"
+
+    def _record_repairs(self, attempts: list[Attempt], *, model: str) -> None:
+        """One ``query.repair`` pair per rejected candidate (D14).
+
+        The repair loop lives inside ``t2s_core`` behind the ``QueryValidator``
+        port (D4), so we learn about each attempt only from the result metadata
+        afterwards. The durations written here are the per-attempt latencies the
+        core measured -- reconstructed, never invented -- which keeps the log
+        one shape rather than growing a third phase meaning "atomic".
+        """
+        for attempt in attempts:
+            if attempt.ok:
+                continue
+            self.activity.note(
+                "query.repair",
+                summary=f"attempt {attempt.index} rejected: {attempt.failure_kind}",
+                status="error",
+                duration_ms=attempt.latency_ms or None,
+                model=model,
+                tokens=attempt.usage.total_tokens or None,
+                detail={
+                    "attempt": attempt.index,
+                    "failure_kind": attempt.failure_kind,
+                    "failure_message": (attempt.failure_message or "")[:400],
+                    "candidate_sql": (attempt.candidate_sql or "")[:1000],
+                },
+            )
+
     def _router_context(self) -> RouterContext:
         with self.store.scope() as db:
             pointers = self._pointers(db)
@@ -615,6 +906,25 @@ class Orchestrator:
                 last_query_id=None,
                 last_question=None,
             )
+
+
+#: What to say when a referent names a kind of output that has never happened.
+_MISSING_REFERENT: dict[str, str] = {
+    "last_query": (
+        "There's no SQL yet for me to point at -- ask me a question about the data first."
+    ),
+    "last_result": "Nothing has been run yet, so there are no results to refer back to.",
+    "last_schema": "No schema has been designed yet. Describe the domain you want to model.",
+    "last_data": "No sample data has been loaded yet.",
+    "none": "I'm not sure what you're referring to.",
+}
+
+
+def _plan_summary(plan: Plan) -> str:
+    """The one-line description of a plan that goes in its activity row."""
+    if not plan.directives:
+        return "no directives"
+    return f"understood: {' → '.join(plan.intents)}"
 
 
 def _from_envelope(result: QueryResult | SchemaResult, *, intent: Intent) -> Turn:

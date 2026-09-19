@@ -1,7 +1,9 @@
 """SQLAlchemy 2.x ORM models (design §4).
 
 Entities: `Project`, `Session`, `DataModel`, `DataModelVersion`, `Schema`,
-`Query`, `Dataset`, `Database`. All primary keys are UUIDs (MAIN.md
+`Query`, `Dataset`, `Database`, plus the two conversational tables
+`SessionState` (pointers) and `Activity` (the append-only transition log,
+D14). All primary keys are UUIDs (MAIN.md
 clarification 3), stored via SQLAlchemy's portable `Uuid` type.
 
 Relationships, derived from `prompts/MAIN.md`'s domain-object descriptions:
@@ -34,7 +36,7 @@ name, dataset/database status) has an index -- see the `Index(...)` /
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 
 from sqlalchemy import JSON as SA_JSON
@@ -346,3 +348,57 @@ class Corrective(Base):
     data_model: Mapped[DataModel] = relationship()
 
     __table_args__ = (Index("ix_correctives_model_active", "data_model_id", "active"),)
+
+
+class Activity(Base):
+    """One transition in a session, appended and never updated (D14).
+
+    D14, from Chris using the chat: *"things are really quite slow and it's hard
+    to know what is going on."* The complaint is observability, and the fix is a
+    record of how the session reached its current state -- not just the state.
+    ``SessionState`` above is the pointers; this is the journal that produced
+    them.
+
+    **Begin and end are two rows, not one row mutated on completion.** That is
+    the whole design and it is worth the extra row: a status table says a step
+    is "running" and is indistinguishable from a step whose process died, while
+    a transition log says a step began at 11:04:02 and never ended -- which is
+    evidence. Nothing in `foundation` offers an UPDATE or DELETE path onto this
+    table; `ActivityRepository` has ``append`` and readers, and that is all.
+
+    ``seq`` is per-session and monotonic, so the log has a total order that does
+    not depend on clock resolution (two activities inside one millisecond are
+    common -- a `begin` and its `end` for a cached read, for instance).
+
+    ``model`` / ``tokens`` / ``request_id`` are populated only where an
+    inference call was involved, which is what lets the eval harness attribute
+    wall-clock to providers rather than guessing.
+    """
+
+    __tablename__ = "activities"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("sessions.id"), nullable=False, index=True
+    )
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    phase: Mapped[str] = mapped_column(String(8), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
+    )
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    detail: Mapped[dict | None] = mapped_column(SA_JSON, nullable=True)
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    session: Mapped[Session] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("session_id", "seq", name="uq_activities_session_seq"),
+        Index("ix_activities_session_seq", "session_id", "seq"),
+        Index("ix_activities_session_kind", "session_id", "kind"),
+    )
