@@ -1,4 +1,4 @@
-"""Sample database lifecycle: create -> load -> query -> destroy (design §4, D9).
+"""Sample database lifecycle: create -> load -> query -> clear -> destroy (design §4, D9).
 
 Files live under `foundation.paths.managed_directory()`, named only by the
 database's UUID (`foundation.paths.database_path`) -- a client-supplied path
@@ -25,6 +25,7 @@ import re
 import sqlite3
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -211,6 +212,81 @@ def query(
         return QueryResult(columns=columns, rows=rows, row_count=len(rows), truncated=truncated)
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# row counts and clear
+# ---------------------------------------------------------------------------
+
+
+def row_counts(database_id: uuid.UUID, tables: Sequence[str]) -> dict[str, int]:
+    """How many rows each named table holds. Opened read-only.
+
+    W17: the confirmation prompt for a destructive action has to say *precisely*
+    what is about to be lost, and "3 tables" is not that -- "142 rows across 3
+    tables" is. Table names come from the caller's own stored entity graph and
+    are validated as identifiers anyway (defense in depth); no name from a model
+    or a user ever reaches this.
+
+    A table named in `tables` that does not exist in the file is reported as 0
+    rather than raising: a schema version can legitimately name a table a
+    database predates, and refusing to describe a database because one table is
+    missing would block the very confirmation that protects it.
+    """
+    path = _existing_path(database_id)
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    counts: dict[str, int] = {}
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        for table in tables:
+            _validate_identifier(table)
+            try:
+                row = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()
+            except sqlite3.Error:
+                counts[table] = 0
+            else:
+                counts[table] = int(row[0]) if row else 0
+    finally:
+        conn.close()
+    return counts
+
+
+def clear(database_id: uuid.UUID, tables: Sequence[str]) -> int:
+    """Delete every row from the named tables, keeping the instance and its DDL.
+
+    The other half of W17's lifecycle pair: `destroy` removes the instance,
+    `clear` empties it. Deliberately a distinct operation rather than
+    "destroy then create", because the two have different consequences -- the
+    database id survives a clear, so anything pointing at it still resolves.
+
+    Foreign keys are disabled for the duration and the whole thing is one
+    transaction: emptying a graph of tables in dependency order is a topological
+    sort we would have to get right on every schema, and a half-cleared database
+    is worse than either outcome. This is an administrative operation on a file
+    we own, like `create` and `load`, and it deliberately does not route through
+    `query()`'s read-only gate (D9) -- that gate exists for *generated* SQL, and
+    nothing generated reaches here.
+    """
+    path = _existing_path(database_id)
+    names = [_validate_identifier(t) for t in tables]
+    conn = sqlite3.connect(str(path))
+    deleted = 0
+    try:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        cursor = conn.cursor()
+        for table in names:
+            try:
+                cursor.execute(f'DELETE FROM "{table}"')
+            except sqlite3.Error:
+                continue  # a table this schema names and this file does not have
+            deleted += cursor.rowcount if cursor.rowcount > 0 else 0
+        conn.commit()
+    except sqlite3.Error as exc:
+        conn.rollback()
+        raise SampleDatabaseError(f"failed to clear sample database: {exc}") from exc
+    finally:
+        conn.close()
+    return deleted
 
 
 # ---------------------------------------------------------------------------

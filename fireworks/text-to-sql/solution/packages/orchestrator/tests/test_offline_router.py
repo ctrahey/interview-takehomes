@@ -47,7 +47,7 @@ from t2s_nl.offline_router import (
 )
 from t2s_nl.orchestrator import Orchestrator
 from t2s_nl.router import RouterContext, route
-from t2s_nl.scenarios import EMPTY_CONTEXT, LOADED_CONTEXT, ROUTER_CASES
+from t2s_nl.scenarios import CONTEXTS, EMPTY_CONTEXT, LOADED_CONTEXT, ROUTER_CASES
 from t2s_nl.store import Store
 
 # --------------------------------------------------------------------------
@@ -111,10 +111,11 @@ def test_it_agrees_with_every_live_captured_router_case() -> None:
     router must refuse. Anything else is a silent disagreement with the model
     we are standing in for.
     """
-    contexts = {"empty": EMPTY_CONTEXT, "loaded": LOADED_CONTEXT}
+    # CONTEXTS, not a local dict of two: the canonical contexts are data now, so
+    # adding a third (W17's `recall`) cannot silently skip cases here.
     disagreements = []
     for utterance, context_name, expected in ROUTER_CASES:
-        plan = classify(utterance, context=contexts[context_name])
+        plan = classify(utterance, context=CONTEXTS[context_name])
         got = plan.intents if plan.directives else ("REFUSED",)
         wants_generation = any(i in GENERATION_INTENTS for i in expected)
         if not ((wants_generation and got == ("REFUSED",)) or got == expected):
@@ -279,8 +280,7 @@ def test_a_matching_fixture_always_wins(
     that was recorded, not from keywords that happen to agree with it.
     """
     _tripwire(monkeypatch)
-    contexts = {"empty": EMPTY_CONTEXT, "loaded": LOADED_CONTEXT}
-    plan = route(utterance, client=offline_client(), context=contexts[context_name])
+    plan = route(utterance, client=offline_client(), context=CONTEXTS[context_name])
     assert plan.routed_by == "model"
     assert plan.routing_note is None
 

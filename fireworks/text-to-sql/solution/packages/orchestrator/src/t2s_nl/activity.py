@@ -55,9 +55,16 @@ __all__ = [
 
 logger = logging.getLogger("t2s_nl.activity")
 
-#: Every kind this package emits. D14 names all eight; the tuple is asserted
-#: against the instrumentation in the test suite so a new step cannot be added
-#: without the taxonomy growing to match.
+#: Every kind this package emits. D14 named eight; W17 added four for the
+#: destructive lifecycle. The tuple is asserted against the instrumentation in
+#: the test suite so a new step cannot be added without the taxonomy growing to
+#: match.
+#:
+#: The four W17 kinds are a pair of pairs, and the split is deliberate:
+#: ``confirm.request``/``confirm.resolve`` record the *permission* -- what was
+#: described to the user and what they said about it -- while ``db.clear`` and
+#: ``db.destroy`` record the *act*. Reading only the second pair would tell you
+#: a database was deleted and not that anyone agreed to it.
 ACTIVITY_KINDS: tuple[str, ...] = (
     "router.classify",
     "schema.generate",
@@ -67,6 +74,11 @@ ACTIVITY_KINDS: tuple[str, ...] = (
     "query.repair",
     "query.execute",
     "corrective.record",
+    "confirm.request",
+    "confirm.resolve",
+    "db.clear",
+    "db.destroy",
+    "database.export",
 )
 
 #: Human wording for a live line, keyed by kind. Front ends may override.
@@ -79,6 +91,11 @@ KIND_LABELS: Mapping[str, str] = {
     "query.repair": "repairing the SQL",
     "query.execute": "running the query",
     "corrective.record": "recording that",
+    "confirm.request": "asking you to confirm",
+    "confirm.resolve": "resolving that confirmation",
+    "db.clear": "clearing the sample data",
+    "db.destroy": "destroying the sample database",
+    "database.export": "saving a copy of the sample database",
 }
 
 

@@ -159,15 +159,38 @@ def run_command(orch: Orchestrator, line: str) -> Turn | str | None:
         "/q": lambda: None,
         "/help": lambda: HELP_TEXT + "\n\n" + SLASH_HELP,
         "/sql": lambda: _current_sql(orch),
-        "/run": orch.run_current_sql,
+        "/run": lambda: _acting(orch, "/run", orch.run_current_sql),
         "/log": lambda: _log(orch, argument),
-        "/fix": lambda: _fix(orch, argument),
-        "/new": lambda: _new(orch),
+        "/fix": lambda: _acting(orch, "/fix", lambda: _fix(orch, argument)),
+        "/new": lambda: _acting(orch, "/new", lambda: _new(orch)),
     }
     handler = handlers.get(command)
     if handler is None:
         return f"  unknown command {command} — /help"
     return handler()
+
+
+def _acting(
+    orch: Orchestrator, command: str, run: Callable[[], Turn | str | None]
+) -> Turn | str | None:
+    """Run a slash command that *does* something, cancelling any pending confirmation.
+
+    W17. Most slash commands are deterministic reads and leave a pending
+    destruction alone; these three act. A confirmation that survived `/new` --
+    which forgets the current model outright -- could then be answered "yes" by
+    a user who had moved on, which is precisely the stale-consent case the
+    confirmation exists to prevent. The router-driven path invalidates for the
+    same reason in `Orchestrator._pending_plan`; these doors are the ones the
+    router never sees.
+    """
+    note = orch.invalidate_pending(f"you ran {command} instead")
+    result = run()
+    if note is None:
+        return result
+    if isinstance(result, Turn):
+        result.notes.insert(0, note)
+        return result
+    return f"  {note}" if result is None else f"  {note}\n{result}"
 
 
 def _current_sql(orch: Orchestrator) -> Turn | str:

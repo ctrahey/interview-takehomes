@@ -33,19 +33,38 @@ Two additions from W13 are worth naming here because they are one mechanism:
   for that?" reads the last successful ``query.generate`` activity. No second
   model call is made to work out what "that" meant, which is exactly why the
   activity log and multi-directive plans are one unit of work and not two.
+
+W17 adds the other end of the lifecycle, and it is the first thing here that is
+irreversible, so it works differently from everything above:
+
+* **``destroy`` and ``clear_data`` never run on the utterance that asked for
+  them.** The first turn resolves *which* database, reads what is actually in it
+  and returns a description plus a question; a ``PendingAction`` row carries the
+  request across the turn boundary. Only an affirmative next turn executes it.
+* **The answer to that question is read in code** (``t2s_nl.confirmation``), not
+  classified by a model, and anything that is neither yes nor no invalidates the
+  pending action and is routed normally -- so a "yes" typed after the
+  conversation has moved on destroys nothing.
+* **The router finally sees the conversation.** ``RouterContext`` carries the
+  last few turns, reconstructed from the activity log (``t2s_nl.history``), so
+  "I already mentioned it" has something to resolve against.
 """
 
 from __future__ import annotations
 
+import os
+import sqlite3
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from functools import partial
+from pathlib import Path
+from typing import Any, cast
 
 from sqlalchemy.orm import Session as OrmSession
 
 from foundation import ddl as ddl_module
-from foundation import sample_db, security
+from foundation import paths, sample_db, security
 from foundation.graph import EntityGraph
 from foundation.models import DataModel, Query, Schema, SessionState
 from foundation.repositories import (
@@ -54,6 +73,7 @@ from foundation.repositories import (
     DataModelRepository,
     DataModelVersionRepository,
     DatasetRepository,
+    PendingActionRepository,
     QueryRepository,
     SchemaRepository,
     SessionRepository,
@@ -69,23 +89,51 @@ from t2s_core import (
 )
 from t2s_core.models import Attempt
 from t2s_core.ports import InferenceClient
+from t2s_nl import confirmation, inspection, lifecycle
 from t2s_nl import data as data_module
-from t2s_nl import inspection
+from t2s_nl import history as history_module
 from t2s_nl.activity import ActivityEmitter, ActivityListener
 from t2s_nl.clients import NO_MODEL_AVAILABLE
 from t2s_nl.correctives import compose_session_summary
-from t2s_nl.intents import Directive, Intent, Plan
+from t2s_nl.intents import Directive, Intent, Parameters, Plan
 from t2s_nl.offline_router import OFFLINE_ROUTING_NOTE
 from t2s_nl.router import RouterContext, no_model_reason, route
 from t2s_nl.store import Store
 from t2s_nl.turns import DataTable, Turn
 
 __all__ = [
+    "CONFIRMATION_NOTE",
     "GENERATION_NEEDS_A_MODEL",
     "HELP_TEXT",
     "MAX_REJECTION_NOTES",
     "Orchestrator",
 ]
+
+#: Shown on a turn that was produced by reading a yes/no answer rather than by
+#: routing it. Same honesty rule as ``OFFLINE_ROUTING_NOTE``: the provenance of
+#: a decision is part of the answer, and this one decided a deletion.
+CONFIRMATION_NOTE = "read as an answer to my question, in code — the model was not asked"
+
+#: What a pending confirmation's cancellation says. The user MUST be told: a
+#: silently dropped confirmation makes a later "yes" a no-op with no explanation.
+_CANCELLED_NOTE = (
+    "I was waiting for you to confirm that I should {action} {subject}; {reason}, "
+    "so I've dropped that request and nothing was deleted. Ask again if you still want it."
+)
+
+
+#: The verb each destructive action is described with, in one place so the
+#: confirmation prompt, the log summary and the cancellation note agree.
+#: Where `export` writes. Overridable so a container can aim it at a mounted
+#: host directory (`T2S_EXPORT_DIR=/export`), which is what makes the copy
+#: reachable from outside the container at all.
+def _export_destination(database_id: uuid.UUID) -> Path:
+    directory = Path(os.environ.get("T2S_EXPORT_DIR") or Path.cwd())
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{database_id.hex[:8]}.sqlite3"
+
+
+_VERB: dict[str, str] = {"destroy": "destroy", "clear_data": "clear the data from"}
 
 #: Backstop for the one boundary this package will not cross: a directive that
 #: got as far as a generation call with no model behind it. The keyword router
@@ -117,6 +165,10 @@ I am a text-to-SQL workbench you can talk to. What I can do, in the order it usu
   run them               "run that"  → rows out of the sample database
   correct me             "actually, price_cents is in cents"
                          → remembered against this model, and used from now on
+  clear or delete it     "empty that database" → rows gone, database stays
+                         "delete the bookstore database" → the instance is gone
+                         both describe exactly what will be lost and wait for
+                         you to say yes; nothing destructive happens on one line
   ask about your stuff   "show me my databases", "what's my current schema"
   ask what I'm doing     "what have you been doing?"  → the activity log, with
                          timings, so a slow turn can be attributed rather than
@@ -144,6 +196,21 @@ class _Pointers:
     database_id: uuid.UUID | None = None
     last_query_id: uuid.UUID | None = None
     last_question: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Pending:
+    """A detached read of the session's pending destructive request (W17).
+
+    Detached for the same reason ``ActivityRecord`` is: everything in this class
+    opens short transactions, and a live ORM object outliving its scope is how
+    a "still pending?" check ends up reading a stale identity map.
+    """
+
+    action: str
+    database_id: uuid.UUID | None
+    description: str
+    detail: dict[str, Any]
 
 
 class Orchestrator:
@@ -198,21 +265,43 @@ class Orchestrator:
         return turns[-1] if turns else Turn.ask("Say something and I'll have a go.")
 
     def plan(self, utterance: str) -> Plan:
-        """The router call, bracketed by a ``router.classify`` activity (D14)."""
+        """The router call, bracketed by a ``router.classify`` activity (D14).
+
+        Two things happen before the model is asked, and both are deliberate.
+
+        A pending destructive confirmation is resolved first (W17). "yes" is not
+        a classification problem: making it one would let a network failure
+        cancel a destruction, a mislabelled enum cause one, and would leave the
+        confirmation flow broken offline. So an affirmative becomes the pending
+        action's own directive, a refusal becomes ``cancel``, and *anything
+        else* invalidates the pending action and falls through to ordinary
+        routing -- the conservative reading, which is the only safe one here.
+
+        The router context is then built *outside* the activity step. It now
+        includes recent turns read from the log, and building it inside would
+        mean this very utterance's ``begin`` row were already on disk and could
+        feed itself back as its own context.
+        """
+        decided, plan_notes = self._pending_plan(utterance)
+        context = self._router_context()
         with self.activity.step(
             "router.classify",
             summary="working out what you meant",
             detail={"utterance": utterance[:200]},
         ) as step:
-            plan = route(
-                utterance,
-                client=self.client,
-                context=self._router_context(),
-                on_response=lambda response: step.record_inference(
-                    model=response.model,
-                    tokens=response.usage.total_tokens,
-                    request_id=response.request_id,
-                ),
+            plan = (
+                decided
+                if decided is not None
+                else route(
+                    utterance,
+                    client=self.client,
+                    context=context,
+                    on_response=lambda response: step.record_inference(
+                        model=response.model,
+                        tokens=response.usage.total_tokens,
+                        request_id=response.request_id,
+                    ),
+                )
             )
             step.note(
                 directives=list(plan.intents),
@@ -222,6 +311,7 @@ class Orchestrator:
                 # which the keyword router did.
                 routed_by=plan.routed_by,
             )
+            plan.notes.extend(n for n in plan_notes if n not in plan.notes)
             if plan.refusal:
                 # The refusal's own first sentence, not a guess at which
                 # refusal it was: the log has to distinguish "too many
@@ -251,7 +341,7 @@ class Orchestrator:
             # Refused whole -- not truncated to the first N, which is how a
             # misreading turns into a chain of unintended actions.
             refused = Turn.error(plan.refusal, intent="unknown")
-            self._note_routing(plan, refused)
+            self._note_routing(plan, refused, first=True)
             if on_turn is not None:
                 on_turn(refused)
             return [refused]
@@ -262,7 +352,7 @@ class Orchestrator:
             turn = self.execute(directive, utterance, clarification=plan.clarifying_question)
             turn.plan_position = position + 1
             turn.plan_length = total
-            self._note_routing(plan, turn)
+            self._note_routing(plan, turn, first=position == 0)
             turns.append(turn)
             if turn.kind != "answer":
                 remaining = total - position - 1
@@ -281,14 +371,23 @@ class Orchestrator:
         return turns
 
     @staticmethod
-    def _note_routing(plan: Plan, turn: Turn) -> None:
+    def _note_routing(plan: Plan, turn: Turn, *, first: bool = False) -> None:
         """Make keyword routing visible on every turn it produced.
 
         Not optional and not a debug flag. The whole justification for the
         keyword router is that the output space is a small enum; the price of
         using it is saying so, every time, so nobody reads a keyword match as
         the model's judgement.
+
+        ``plan.notes`` -- currently only "a pending destruction was cancelled
+        because you moved on" (W17) -- goes on the **first** turn alone. It is
+        about the utterance, not about any one directive, and repeating it under
+        each half of a compound answer would read as two cancellations.
         """
+        if first:
+            for note in plan.notes:
+                if note not in turn.notes:
+                    turn.notes.append(note)
         if plan.routed_by != "keyword":
             return
         note = plan.routing_note or OFFLINE_ROUTING_NOTE
@@ -326,6 +425,14 @@ class Orchestrator:
             ),
             "execute": lambda: self._execute_sql(referent=directive.referent),
             "corrective": lambda: self._corrective(params.text or utterance),
+            # W17. Both go through one gate, and neither can act on this turn
+            # unless a pending confirmation for exactly this action already
+            # exists -- which `plan()` guarantees only happens after the user
+            # said yes to it.
+            "destroy": lambda: self._lifecycle(directive, action="destroy"),
+            "clear_data": lambda: self._lifecycle(directive, action="clear_data"),
+            "export": partial(self._export, directive),
+            "cancel": self._cancel_pending,
         }
         handler = handlers.get(intent)
         if handler is None:  # "unknown", and anything the enum grows later
@@ -473,6 +580,19 @@ class Orchestrator:
             pointers = self._pointers(db)
             existing_ddl = self._current_ddl(db, pointers)
             correctives = self._corrective_texts(db, pointers.data_model_id)
+            current_model = (
+                db.get(DataModel, pointers.data_model_id)
+                if pointers.data_model_id is not None
+                else None
+            )
+            # The name this model will have once saved, worked out *before* the
+            # call so the step can record what it is about. Exact in all three
+            # branches, because `_model_for_revision` applies the same
+            # precedence: an explicit name, else the model being revised, else
+            # one derived from the description.
+            subject = (
+                name or (current_model.name if current_model else None) or _derive_name(description)
+            )
 
         background = None
         if existing_ddl:
@@ -484,7 +604,11 @@ class Orchestrator:
         with self.activity.step(
             "schema.generate",
             summary="designing the schema",
-            detail={"description": description[:200], "iterating": bool(existing_ddl)},
+            detail={
+                "description": description[:200],
+                "iterating": bool(existing_ddl),
+                history_module.SUBJECT_KEY: f"data model {subject!r}",
+            },
         ) as step:
             result = generate_schema(
                 SchemaRequest(
@@ -610,6 +734,12 @@ class Orchestrator:
                 else None
             )
             correctives = self._corrective_texts(db, pointers.data_model_id)
+            model_row = (
+                db.get(DataModel, pointers.data_model_id)
+                if pointers.data_model_id is not None
+                else None
+            )
+            model_name = (model_row.name if model_row else None) or "(unnamed)"
         if schema_ddl is None or graph is None or pointers.schema_id is None:
             return Turn.ask(
                 "There's no schema to load data into yet. Describe the domain you want to "
@@ -652,7 +782,12 @@ class Orchestrator:
         with self.activity.step(
             "data.load",
             summary="loading sample data",
-            detail={"database": str(database_id)[:8]},
+            detail={
+                "database": str(database_id)[:8],
+                # Name, never the id: this reaches the router as history, and a
+                # fresh UUID per run is a prompt no fixture can match twice (D8).
+                history_module.SUBJECT_KEY: (f"the sample database for data model {model_name!r}"),
+            },
         ) as load_step:
             inserted = sample_db.load(database_id, validated.rows)
             load_step.summary = f"loaded {inserted} rows into {str(database_id)[:8]}"
@@ -821,6 +956,373 @@ class Orchestrator:
     def add_corrective(self, text: str) -> Turn:
         return self._corrective(text)
 
+    # -- the destructive lifecycle (W17) ----------------------------------
+    #
+    # One gate, two actions, and a single invariant that makes the gate real:
+    #
+    #     a destructive handler acts ONLY when a PendingAction for exactly that
+    #     action already exists, and `plan()` lets one survive into `execute()`
+    #     only when the user's own next utterance was an affirmative.
+    #
+    # It is structural rather than a flag on the directive. A flag would be a
+    # field on a model the router fills in, and "the model may not set this one
+    # field" is a weaker guarantee than "the permission lives in a different
+    # table, written by us, in the previous turn".
+
+    def _lifecycle(self, directive: Directive, *, action: str) -> Turn:
+        """Either perform a confirmed destruction, or describe one and ask."""
+        pending = self._read_pending()
+        if pending is not None and pending.action == action:
+            return self._perform(pending)
+        if pending is not None:  # pragma: no cover - `plan()` clears these first
+            self._drop_pending("a different destructive request replaced it")
+        return self._request_confirmation(directive, action=action)
+
+    def _request_confirmation(self, directive: Directive, *, action: str) -> Turn:
+        """Turn one: say exactly what would be lost, record the request, do nothing.
+
+        "Exactly" is the whole job. "Delete the database?" is not a confirmation
+        anybody can give meaningfully; "database 3f2a91b4, built from data model
+        'sports-league', 142 rows across 5 tables" is. The counts are read from
+        the file itself, not from what we believe we loaded.
+        """
+        intent = cast("Intent", action)
+        named = (directive.parameters.model_ref or "").strip() or None
+        with self.store.scope() as db:
+            pointers = self._pointers(db)
+            resolution = lifecycle.resolve(
+                db,
+                self.store.project_id,
+                named=named,
+                current_database_id=pointers.database_id,
+            )
+
+        if isinstance(resolution, lifecycle.NotFound):
+            return Turn.ask(
+                _no_target_message(resolution, action),
+                intent=intent,
+                table=_options_table(resolution.available),
+            )
+        if isinstance(resolution, lifecycle.Ambiguous):
+            return Turn.ask(
+                f"I could {_VERB[action]} more than one thing there, and I won't guess which "
+                f"— {_VERB[action]} is not undoable. Which of these did you mean? Say the "
+                "model's name.",
+                intent=intent,
+                table=_options_table(resolution.options),
+            )
+
+        target = resolution
+        table, total = lifecycle.describe(target)
+        description = _describe_consequence(action, target, total)
+        with (
+            self.activity.step(
+                "confirm.request",
+                summary=f"awaiting your confirmation to {_VERB[action]} {target.short_id}",
+                detail={
+                    "action": action,
+                    "database": str(target.database_id),
+                    "model": target.model_name,
+                    "rows": total,
+                    "tables": list(target.tables),
+                    history_module.SUBJECT_KEY: target.label,
+                },
+            ) as step,
+            self.store.scope() as db,
+        ):
+            PendingActionRepository(db).request(
+                self.store.session_id,
+                action=action,
+                description=description,
+                database_id=target.database_id,
+                detail={
+                    "model": target.model_name,
+                    "rows": total,
+                    history_module.SUBJECT_KEY: target.label,
+                },
+                requested_seq=step.begin_seq,
+            )
+        return Turn.ask(
+            f"{description} Nothing has been changed yet — reply "
+            f"{confirmation.AFFIRMATIVE_EXAMPLES} and I'll do it; say anything else and "
+            "I'll leave it alone.",
+            intent=intent,
+            table=table,
+        )
+
+    def _perform(self, pending: _Pending) -> Turn:
+        """Turn two: the user said yes. Consume the permission, then act.
+
+        The pending row is cleared **first**. A destruction that dies halfway
+        must not leave a live "yes" behind it that a later utterance could
+        re-trigger; making the user ask again is the cheap failure.
+        """
+        action = pending.action
+        intent = cast("Intent", action)
+        subject = pending.detail.get(history_module.SUBJECT_KEY)
+        with self.store.scope() as db:
+            PendingActionRepository(db).clear(self.store.session_id)
+        self.activity.note(
+            "confirm.resolve",
+            summary=f"you confirmed: {_VERB[action]} {subject or 'it'}",
+            detail={
+                "action": action,
+                "outcome": "confirmed",
+                history_module.SUBJECT_KEY: subject,
+            },
+        )
+
+        if pending.database_id is None:  # pragma: no cover - never written null
+            return Turn.error(
+                "I've lost track of which database that was. Ask again and I'll re-check.",
+                intent=intent,
+            )
+        with self.store.scope() as db:
+            target = next(
+                (
+                    t
+                    for t in lifecycle.candidates(db, self.store.project_id)
+                    if t.database_id == pending.database_id
+                ),
+                None,
+            )
+        if target is None:
+            return Turn.error(
+                "That sample database is already gone, so there was nothing to do.",
+                intent=intent,
+            )
+        return self._do_destroy(target) if action == "destroy" else self._do_clear(target)
+
+    def _do_destroy(self, target: lifecycle.Target) -> Turn:
+        """Delete the instance. The `Database` row survives, marked destroyed.
+
+        Deliberately not a row deletion: the metadata store is the record that
+        this database existed and was destroyed, and `destroyed_at` is only
+        meaningful if the row outlives the file. The data model, its versions
+        and its schema are untouched -- the user can build another database from
+        the same schema, which is exactly why `destroy` and `create_schema` are
+        different intents.
+        """
+        with self.activity.step(
+            "db.destroy",
+            summary=f"destroying database {target.short_id}",
+            detail={
+                "database": str(target.database_id),
+                "model": target.model_name,
+                history_module.SUBJECT_KEY: target.label,
+            },
+        ) as step:
+            sample_db.destroy(target.database_id)
+            with self.store.scope() as db:
+                DatabaseRepository(db).mark_destroyed(target.database_id)
+                if self._pointers(db).database_id == target.database_id:
+                    SessionStateRepository(db).set(self.store.session_id, current_database_id=None)
+            step.summary = f"destroyed database {target.short_id} ({target.model_name})"
+        return Turn(
+            intent="destroy",
+            text=(
+                f"Destroyed sample database {target.short_id}, built from data model "
+                f"{target.model_name!r}."
+            ),
+            notes=[
+                f"the data model {target.model_name!r} and its schema are untouched — "
+                "say 'load it with data' to build a fresh database from the same schema",
+            ],
+            deterministic_answer=True,
+        )
+
+    def _do_clear(self, target: lifecycle.Target) -> Turn:
+        """Empty the rows and leave everything else standing."""
+        with self.activity.step(
+            "db.clear",
+            summary=f"clearing database {target.short_id}",
+            detail={
+                "database": str(target.database_id),
+                "model": target.model_name,
+                history_module.SUBJECT_KEY: target.label,
+            },
+        ) as step:
+            deleted = sample_db.clear(target.database_id, target.tables)
+            with self.store.scope() as db:
+                DatabaseRepository(db).mark_empty(target.database_id)
+            step.summary = f"cleared {deleted} row(s) from {target.short_id}"
+            step.note(deleted=deleted)
+        table, _ = lifecycle.describe(target)
+        return Turn(
+            intent="clear_data",
+            text=(
+                f"Deleted {deleted} row(s) from sample database {target.short_id}. The "
+                "database and its tables are still there, empty."
+            ),
+            table=table,
+            notes=["say 'load it with data' to fill it again"],
+            deterministic_answer=True,
+        )
+
+    def _export(self, directive: Directive) -> Turn:
+        """Save a copy of the sample database where the user can open it themselves.
+
+        Deliberately not destructive and deliberately not clever: it copies, it
+        says where, and it stops. The value of this turn is that everything
+        *after* it happens in tools this system does not control -- DB Browser,
+        the sqlite3 shell, anything -- which is the only kind of check that can
+        corroborate our own answers.
+
+        `VACUUM INTO` rather than a file copy: the snapshot goes through SQLite,
+        so a database mid-write cannot produce a torn file. The source is opened
+        read-only; exporting can never be what changed the data.
+        """
+        with self.store.scope() as db:
+            pointers = self._pointers(db)
+            database_id = pointers.database_id
+        if database_id is None:
+            return Turn.ask(
+                "There's no sample database in this session yet to copy. "
+                "Create one and load some data first.",
+                intent="export",
+            )
+
+        destination = _export_destination(database_id)
+        if destination.exists():
+            destination.unlink()
+        source = paths.database_path(database_id)
+        if not source.exists():
+            return Turn.ask("That sample database has no file on disk any more.", intent="export")
+
+        with self.activity.step(
+            "database.export",
+            summary="saving a copy you can open yourself",
+            detail={"database_id": str(database_id)},
+        ) as step:
+            connection = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+            try:
+                connection.execute("VACUUM INTO ?", (str(destination),))
+            finally:
+                connection.close()
+            step.note(path=str(destination), bytes=destination.stat().st_size)
+
+        return Turn(
+            intent="export",
+            text=f"Saved a copy to {destination}",
+            notes=[
+                f"{destination.stat().st_size} bytes, a plain SQLite file",
+                "open it with DB Browser, the sqlite3 shell, or anything else -- "
+                "nothing downstream of that file needs this workbench",
+            ],
+            deterministic_answer=True,
+        )
+
+    def _cancel_pending(self) -> Turn:
+        """The user said no."""
+        pending = self._drop_pending("you said no")
+        if pending is None:
+            return Turn.ask(
+                "There's nothing waiting on a yes or no from me right now.", intent="cancel"
+            )
+        subject = pending.detail.get(history_module.SUBJECT_KEY) or "it"
+        return Turn(
+            intent="cancel",
+            text=f"Left alone — nothing was deleted from {subject}.",
+            deterministic_answer=True,
+        )
+
+    def invalidate_pending(self, reason: str) -> str | None:
+        """Cancel any pending confirmation. Returns a line to show, or ``None``.
+
+        Public because the surfaces have doors the router never sees: ``/run``,
+        ``/fix`` and ``/new`` all *do* something without going through
+        :meth:`plan`, and a pending destruction that survived one of those would
+        be answerable by a "yes" the user no longer means.
+        """
+        pending = self._drop_pending(reason)
+        if pending is None:
+            return None
+        return _CANCELLED_NOTE.format(
+            action=_VERB[pending.action],
+            subject=pending.detail.get(history_module.SUBJECT_KEY) or "that database",
+            reason=reason,
+        )
+
+    # -- pending-confirmation plumbing ------------------------------------
+    def _pending_plan(self, utterance: str) -> tuple[Plan | None, list[str]]:
+        """Read this utterance as an answer to a pending confirmation, if there is one.
+
+        Returns the plan to run instead of routing (or ``None`` to route
+        normally) and any notes the user must see regardless.
+
+        The third branch is the one that matters. "Anything else" is not treated
+        as a maybe: it invalidates. Chris's own transcript is the argument —
+        three consecutive turns drifted further from the original request, and a
+        "yes" at the end of that drift must not delete something nobody is
+        thinking about any more.
+        """
+        pending = self._read_pending()
+        if pending is None:
+            return None, []
+        verdict = confirmation.read(utterance)
+        if verdict == "affirmative":
+            return (
+                Plan(
+                    directives=[
+                        Directive(
+                            intent=cast("Intent", pending.action),
+                            parameters=Parameters(model_ref=pending.detail.get("model")),
+                            rationale="you confirmed the pending request",
+                        )
+                    ],
+                    confidence="high",
+                    routed_by="keyword",
+                    routing_note=CONFIRMATION_NOTE,
+                ),
+                [],
+            )
+        if verdict == "negative":
+            return (
+                Plan(
+                    directives=[
+                        Directive(intent="cancel", rationale="you declined the pending request")
+                    ],
+                    confidence="high",
+                    routed_by="keyword",
+                    routing_note=CONFIRMATION_NOTE,
+                ),
+                [],
+            )
+        note = self.invalidate_pending("you asked for something else instead")
+        return None, [note] if note else []
+
+    def _read_pending(self) -> _Pending | None:
+        with self.store.scope() as db:
+            row = PendingActionRepository(db).get(self.store.session_id)
+            if row is None:
+                return None
+            return _Pending(
+                action=row.action,
+                database_id=row.database_id,
+                description=row.description,
+                detail=dict(row.detail or {}),
+            )
+
+    def _drop_pending(self, reason: str) -> _Pending | None:
+        """Clear the pending action and record *why* in the log (D14)."""
+        pending = self._read_pending()
+        if pending is None:
+            return None
+        with self.store.scope() as db:
+            PendingActionRepository(db).clear(self.store.session_id)
+        self.activity.note(
+            "confirm.resolve",
+            summary=f"not confirmed: {reason}",
+            status="refused",
+            detail={
+                "action": pending.action,
+                "outcome": "cancelled",
+                "reason": reason,
+                history_module.SUBJECT_KEY: pending.detail.get(history_module.SUBJECT_KEY),
+            },
+        )
+        return pending
+
     # -- internals --------------------------------------------------------
     def _record_generation(
         self, step: Any, result: QueryResult | SchemaResult, *, key: str
@@ -891,6 +1393,13 @@ class Orchestrator:
                 has_last_query=pointers.last_query_id is not None,
                 last_question=pointers.last_question,
                 corrective_count=len(correctives),
+                # W17. Read out of the D14 log rather than kept alongside it --
+                # the log already has the utterance, the intents it produced and
+                # (since W17) the object each step touched, and a second
+                # transcript would be a second thing to keep true.
+                recent=history_module.recent_turns(
+                    self.activity.history(limit=history_module.SCAN_ROWS)
+                ),
             )
 
     def _pointers(self, db: OrmSession) -> _Pointers:
@@ -979,6 +1488,56 @@ _MISSING_REFERENT: dict[str, str] = {
 
 #: Longest refusal fragment to put in an activity summary before truncating.
 _SUMMARY_CHARS = 72
+
+
+def _describe_consequence(action: str, target: lifecycle.Target, total_rows: int) -> str:
+    """One sentence naming what is lost and what survives.
+
+    Both halves are load-bearing. The user who said "clear out the sports league
+    database? just totally delete it" was holding both readings at once, so the
+    reply has to draw the line rather than assume they already had.
+    """
+    tables = len(target.tables)
+    if action == "destroy":
+        return (
+            f"That would permanently delete sample database {target.short_id}, built from "
+            f"data model {target.model_name!r} — {total_rows} row(s) across {tables} "
+            "table(s), and the tables themselves. The data model and its schema would "
+            "survive; only this database instance goes."
+        )
+    return (
+        f"That would delete all {total_rows} row(s) from sample database "
+        f"{target.short_id} (data model {target.model_name!r}), across {tables} table(s). "
+        "The database itself, its tables and its schema all survive, and it can be "
+        "loaded again."
+    )
+
+
+def _options_table(targets: Sequence[lifecycle.Target]) -> DataTable | None:
+    if not targets:
+        return None
+    return DataTable(
+        columns=["id", "data model", "status"],
+        rows=[[t.short_id, t.model_name, t.status] for t in targets],
+        caption="sample databases in this project",
+    )
+
+
+def _no_target_message(resolution: lifecycle.NotFound, action: str) -> str:
+    if not resolution.available:
+        return (
+            "There are no sample databases in this project, so there is nothing to "
+            f"{_VERB[action]}."
+        )
+    if resolution.named:
+        return (
+            f"I couldn't find a sample database matching {resolution.named!r}. These are "
+            "the ones you have — say which, by its model's name or its id."
+        )
+    return (
+        f"Which sample database should I {_VERB[action]}? I won't pick one for you when "
+        "the answer isn't reversible."
+    )
 
 
 def _plan_summary(plan: Plan) -> str:

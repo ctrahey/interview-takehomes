@@ -18,6 +18,7 @@ import os
 import sys
 import uuid
 from datetime import UTC, datetime
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -25,7 +26,7 @@ from nl_doubles import ExplodingClient, ScriptedClient, envelope_payload, router
 from sqlalchemy import event
 
 from foundation.repositories import ActivityRepository
-from t2s_nl.activity import ACTIVITY_KINDS, ActivityEmitter, ActivityRecord
+from t2s_nl.activity import ACTIVITY_KINDS, ActivityEmitter, ActivityRecord, record_of
 from t2s_nl.chat import run_command
 from t2s_nl.live import LiveActivityDisplay, format_end
 from t2s_nl.orchestrator import Orchestrator
@@ -100,6 +101,35 @@ def _drive(store: Store, listener: object | None = None) -> Orchestrator:
     return orch
 
 
+def _drive_lifecycle(store: Store) -> Orchestrator:
+    """`_drive`, then W17's destructive lifecycle: clear, then destroy.
+
+    Its own helper rather than more turns on `_drive`, because `_drive` is
+    shared and its contract is "ends with a loaded sample database" -- a
+    destruction at the end of it would quietly break every caller that relies on
+    that, starting with the export test.
+
+    The scripted client is rebuilt with only the two lifecycle classifications
+    in its router queue, and *no* payload for the confirmations: "yes" is read
+    by `t2s_nl.confirmation` and never reaches a model, which is the property
+    being exercised as much as the logging is.
+    """
+    orch = _drive(store)
+    orch.client = ScriptedClient(  # type: ignore[assignment]
+        router=[router_payload("clear_data"), router_payload("destroy")]
+    )
+    orch.run("empty that database")
+    orch.run("yes")
+    orch.run("delete that database")
+    orch.run("yes")
+    return orch
+
+
+def _log_records(store: Store):  # type: ignore[no-untyped-def]
+    with store.scope() as db:
+        return [record_of(r) for r in ActivityRepository(db).list_for_session(store.session_id)]
+
+
 def _rows(store: Store) -> list[tuple[str, str, str]]:
     with store.scope() as db:
         return [
@@ -110,12 +140,49 @@ def _rows(store: Store) -> list[tuple[str, str, str]]:
 
 # -- the taxonomy ----------------------------------------------------------
 def test_every_kind_d14_names_is_actually_emitted(store: Store, sample_db_dir: Path) -> None:
-    """D14 lists eight kinds. Seven come out of the ordinary path; the eighth
-    (``query.repair``) needs a rejected candidate, which has its own test."""
-    _drive(store)
+    """Every kind in the taxonomy comes out of a real path.
+
+    D14 named eight; W17 added four for the destructive lifecycle. Two are
+    excluded here and have their own tests: ``query.repair`` needs a rejected
+    candidate, and ``database.export`` is not on this path at all.
+    """
+    _drive_lifecycle(store)
     emitted = {kind for kind, _, _ in _rows(store)}
-    assert emitted == set(ACTIVITY_KINDS) - {"query.repair"}
+    assert emitted == set(ACTIVITY_KINDS) - {"query.repair", "database.export"}
     assert set(ACTIVITY_KINDS) >= emitted
+
+
+def test_a_destruction_logs_the_request_and_the_outcome_separately(
+    store: Store, sample_db_dir: Path
+) -> None:
+    """D14 on the destructive path: who asked, what they were told, what happened.
+
+    A log that recorded only ``db.destroy`` would say a database was deleted and
+    not that anyone agreed to it. ``confirm.request`` carries what the user was
+    shown -- including the row count they were shown -- and ``confirm.resolve``
+    carries their answer.
+    """
+    _drive_lifecycle(store)
+    rows = [
+        r
+        for r in _log_records(store)
+        if r.kind in {"confirm.request", "confirm.resolve", "db.clear", "db.destroy"}
+        and r.phase == "end"
+    ]
+    kinds = [r.kind for r in rows]
+    assert kinds == [
+        "confirm.request",
+        "confirm.resolve",
+        "db.clear",
+        "confirm.request",
+        "confirm.resolve",
+        "db.destroy",
+    ], kinds
+    requested = rows[0]
+    assert requested.detail is not None
+    assert requested.detail["action"] == "clear_data"
+    assert "rows" in requested.detail and "tables" in requested.detail
+    assert all(r.status == "ok" for r in rows)
 
 
 def test_every_step_is_a_begin_and_an_end_in_that_order(store: Store, sample_db_dir: Path) -> None:
@@ -394,3 +461,38 @@ def test_a_rejected_candidate_appends_a_query_repair_activity(
     assert end.detail["candidate_sql"] == "SELECT * FROM shelves"
     assert end.detail["failure_kind"]
     assert "rejected" in (end.summary or "")
+
+
+def test_export_writes_a_standalone_file_and_logs_it(
+    store: Store, sample_db_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`export` is the turn whose whole purpose is to end our involvement.
+
+    What it produces has to open without us -- so this reads it back with a
+    bare sqlite3 connection that knows nothing about the workbench.
+    """
+    monkeypatch.setenv("T2S_EXPORT_DIR", str(tmp_path))
+    orch = _drive(store)  # leaves a loaded sample database on the session
+    # `_drive`'s scripted router queue is exhausted by the turns above and
+    # repeats its last entry, so give this turn its own classification.
+    orch.client = ScriptedClient(router=[router_payload("export")])  # type: ignore[assignment]
+    turn = orch.run("save a copy of this database locally")[-1]
+
+    assert turn.intent == "export"
+    written = sorted(tmp_path.glob("*.sqlite3"))
+    assert len(written) == 1, f"expected one exported file, got {written}"
+    assert str(written[0]) in turn.text
+
+    connection = sqlite3.connect(written[0])
+    try:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+    finally:
+        connection.close()
+    assert tables, "the exported file has no tables in it"
+
+    assert "database.export" in {kind for kind, _, _ in _rows(store)}

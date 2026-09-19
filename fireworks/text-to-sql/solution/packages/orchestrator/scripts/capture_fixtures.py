@@ -41,8 +41,7 @@ from t2s_nl.clients import NL_FIXTURE_DIR, read_api_key
 from t2s_nl.orchestrator import Orchestrator
 from t2s_nl.router import route
 from t2s_nl.scenarios import (
-    EMPTY_CONTEXT,
-    LOADED_CONTEXT,
+    CONTEXTS,
     MONEY_PATH,
     ROUTER_CASES,
     SECURITY_SCRIPTS,
@@ -100,18 +99,22 @@ def capture_router(client: CachingRecorder) -> int:
     response makes ``reasoning_effort="none"`` misclassify, it shows up here as
     a number, at capture time, rather than as a mystery in CI.
     """
-    print(f"router: {len(ROUTER_CASES)} utterances x 2 contexts")
+    print(f"router: {len(ROUTER_CASES)} utterances x {len(CONTEXTS)} contexts")
     diffs = 0
     for utterance, context_name, expected in ROUTER_CASES:
-        # Capture EVERY utterance against BOTH contexts, not just the one the
-        # case declares. The router context is part of the prompt, so an empty
-        # session and a loaded one produce different request keys for the same
-        # words -- and offline mode starts every conversation empty. Capturing
-        # only the declared context is why T2S_OFFLINE=1 died on "show me my
-        # databases" the moment a real user typed it into a fresh session.
+        # Capture EVERY utterance against EVERY canonical context, not just the
+        # one the case declares. The router context is part of the prompt, so an
+        # empty session and a loaded one produce different request keys for the
+        # same words -- and offline mode starts every conversation empty.
+        # Capturing only the declared context is why T2S_OFFLINE=1 died on "show
+        # me my databases" the moment a real user typed it into a fresh session.
+        #
+        # Iterating CONTEXTS rather than naming them is the W17 fix to the same
+        # bug in its next form: a third context was added and a hand-written
+        # dict of two would have orphaned every case that used it, silently.
         plans = {
-            "empty": route(utterance, client=client, context=EMPTY_CONTEXT),
-            "loaded": route(utterance, client=client, context=LOADED_CONTEXT),
+            name: route(utterance, client=client, context=context)
+            for name, context in CONTEXTS.items()
         }
         # The expectation belongs to the declared context only: "run that"
         # means something different with nothing to run.

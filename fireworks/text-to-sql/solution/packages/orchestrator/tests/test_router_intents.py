@@ -14,13 +14,13 @@ from __future__ import annotations
 import pytest
 
 from t2s_nl.clients import offline_client
-from t2s_nl.intents import INTENTS
+from t2s_nl.intents import WIRE_INTENTS
 from t2s_nl.router import RouterContext, route
-from t2s_nl.scenarios import EMPTY_CONTEXT, LOADED_CONTEXT, ROUTER_CASES
+from t2s_nl.scenarios import CONTEXTS, EMPTY_CONTEXT, LOADED_CONTEXT, RECALL_CONTEXT, ROUTER_CASES
 
 
 def _context(name: str) -> RouterContext:
-    return LOADED_CONTEXT if name == "loaded" else EMPTY_CONTEXT
+    return CONTEXTS.get(name, EMPTY_CONTEXT)
 
 
 @pytest.mark.parametrize(
@@ -82,8 +82,14 @@ def test_nonsense_is_a_question_not_a_guess() -> None:
 
 
 def test_every_intent_is_exercised_by_the_table() -> None:
+    """Every intent the model can emit needs a case. `cancel` is not one of them.
+
+    `cancel` is produced only by reading a "no" against a pending confirmation,
+    in code, and is deliberately absent from the wire schema -- so there is no
+    utterance the router could be given that should classify as it.
+    """
     covered = {intent for _, _, expected in ROUTER_CASES for intent in expected}
-    assert covered == set(INTENTS), f"intents with no case: {set(INTENTS) - covered}"
+    assert covered == set(WIRE_INTENTS), f"intents with no case: {set(WIRE_INTENTS) - covered}"
 
 
 def test_the_compound_utterances_that_used_to_be_truncated() -> None:
@@ -115,3 +121,61 @@ def test_the_compound_utterances_that_used_to_be_truncated() -> None:
     assert referent.intents == ("inspect",)
     assert referent.primary.referent == "last_query"
     assert referent.primary.referent_kind == "query.generate"
+
+
+# -- W17 ------------------------------------------------------------------
+def test_the_destructive_pair_is_told_apart_and_the_ambiguous_one_is_not_guessed() -> None:
+    """The defect, in one test.
+
+    "delete the sports league database" has to become a `destroy` naming that
+    database -- the workbench previously had no intent it could become at all.
+    "clear out ... just totally delete it", Chris's actual first message, offers
+    both readings and must come back as a question: one of the two is not
+    undoable, so a coin flip is not an acceptable answer.
+    """
+    destroy = route(
+        "delete the sports league database", client=offline_client(), context=LOADED_CONTEXT
+    )
+    assert destroy.intents == ("destroy",)
+    assert "sport" in (destroy.primary.parameters.model_ref or "").lower()
+
+    clear = route(
+        "empty the bookstore database but keep the tables",
+        client=offline_client(),
+        context=LOADED_CONTEXT,
+    )
+    assert clear.intents == ("clear_data",)
+
+    both = route(
+        "can you clear out the sports league database? Just totally delete it.",
+        client=offline_client(),
+        context=LOADED_CONTEXT,
+    )
+    assert both.intents == ("unknown",)
+    assert both.clarifying_question
+
+
+def test_a_back_reference_resolves_against_history_instead_of_asking_again() -> None:
+    """Defect 2. Neither utterance is answerable from the state checklist alone."""
+    named = route(
+        "delete the one I already mentioned", client=offline_client(), context=RECALL_CONTEXT
+    )
+    assert named.intents == ("destroy",)
+
+    # The bare complaint stays `unknown` -- two antecedents, no verb, and asking
+    # is correct. What changed is the question: with history it cites the
+    # conversation, and without it the router has nothing to cite. That delta is
+    # the measurable half of the fix, so it is what is asserted.
+    with_history = route(
+        "I already mentioned it - do you not have that context?",
+        client=offline_client(),
+        context=RECALL_CONTEXT,
+    )
+    without = route(
+        "I already mentioned it - do you not have that context?",
+        client=offline_client(),
+        context=LOADED_CONTEXT,
+    )
+    assert with_history.intents == ("unknown",)
+    assert "mentioned" in (with_history.clarifying_question or "")
+    assert with_history.clarifying_question != without.clarifying_question
