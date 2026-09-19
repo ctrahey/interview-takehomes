@@ -21,6 +21,7 @@ rotated key.
 from __future__ import annotations
 
 import json
+import sqlite3
 import os
 import subprocess
 import sys
@@ -492,6 +493,51 @@ def db_path(database_id: str, sql: str | None) -> None:
     # -readonly so an independent check can never be the thing that mutates
     # the data it is checking.
     click.echo(f'sqlite3 -readonly -header -box "{path}" "{sql}"')
+
+
+@db.command("export")
+@click.argument("database_id")
+@click.option(
+    "--out", "out_path", default=None, help="Where to write it (default: ./<id>.sqlite3)."
+)
+def db_export(database_id: str, out_path: str | None) -> None:
+    """Write a standalone copy of a sample database to a file you own.
+
+    The point of this command is to stop being involved. What it produces is an
+    ordinary SQLite file that DB Browser, the `sqlite3` shell, or anything else
+    opens without knowing this project exists -- which is what makes checking
+    the workbench's answer against it worth anything. A validation performed
+    with the tool under test validates very little.
+
+    Uses `VACUUM INTO`, not a file copy: it takes a consistent snapshot through
+    SQLite itself, so a database mid-write cannot produce a torn file.
+    """
+    directory = managed_directory()
+    wanted = database_id.replace("-", "").lower()
+    matches = sorted(p for p in directory.glob("*.sqlite3") if p.stem.startswith(wanted))
+    if not matches:
+        raise click.ClickException(
+            f"No sample database starting with {database_id!r} in {directory}"
+        )
+    if len(matches) > 1:
+        listed = "\n  ".join(m.stem[:12] for m in matches)
+        raise click.ClickException(f"{database_id!r} is ambiguous:\n  {listed}")
+
+    source = matches[0]
+    destination = Path(out_path) if out_path else Path.cwd() / f"{source.stem[:8]}.sqlite3"
+    if destination.exists():
+        raise click.ClickException(f"{destination} already exists; refusing to overwrite it")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    try:
+        conn.execute("VACUUM INTO ?", (str(destination),))
+    finally:
+        conn.close()
+
+    size = destination.stat().st_size
+    click.echo(f"{destination}  ({size} bytes)")
+    click.echo("A plain SQLite file. Open it with anything -- this project is no longer involved.")
 
 
 @db.command("destroy")

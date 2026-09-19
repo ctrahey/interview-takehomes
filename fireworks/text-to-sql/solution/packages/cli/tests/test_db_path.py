@@ -51,3 +51,37 @@ def test_an_unknown_id_fails_clearly(sample_db: uuid.UUID) -> None:
     result = CliRunner().invoke(cli, ["db", "path", "ffffffff"])
     assert result.exit_code != 0
     assert "No sample database" in result.output
+
+
+def test_export_produces_a_file_any_tool_can_open(sample_db: uuid.UUID, tmp_path: Path) -> None:
+    """The exported file must stand alone -- that is the entire point of it."""
+    out = tmp_path / "exported" / "copy.sqlite3"
+    result = CliRunner().invoke(cli, ["db", "export", sample_db.hex[:8], "--out", str(out)])
+    assert result.exit_code == 0, result.output
+    assert out.exists()
+
+    # Opened with a fresh connection that knows nothing about this project.
+    conn = sqlite3.connect(out)
+    try:
+        assert conn.execute("SELECT name FROM widgets").fetchall() == [("sprocket",)]
+    finally:
+        conn.close()
+
+
+def test_export_refuses_to_overwrite(sample_db: uuid.UUID, tmp_path: Path) -> None:
+    out = tmp_path / "copy.sqlite3"
+    out.write_text("not a database")
+    result = CliRunner().invoke(cli, ["db", "export", sample_db.hex[:8], "--out", str(out)])
+    assert result.exit_code != 0
+    assert "already exists" in result.output
+    assert out.read_text() == "not a database"
+
+
+def test_export_leaves_the_source_untouched(sample_db: uuid.UUID, tmp_path: Path) -> None:
+    """VACUUM INTO reads; it must never write back to the sample database."""
+    source = Path(CliRunner().invoke(cli, ["db", "path", sample_db.hex[:8]]).output.strip())
+    before = source.read_bytes()
+    CliRunner().invoke(
+        cli, ["db", "export", sample_db.hex[:8], "--out", str(tmp_path / "c.sqlite3")]
+    )
+    assert source.read_bytes() == before

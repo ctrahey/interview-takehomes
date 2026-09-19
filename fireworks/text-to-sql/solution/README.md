@@ -52,26 +52,33 @@ schema the system had just designed seconds earlier, in a database with zero row
 This is the tier that makes a plausible-looking wrong answer hard to hand back. Unknown columns,
 unknown tables, bad `GROUP BY`, and syntax errors cannot survive it.
 
-### Verify it yourself, with a tool this system does not control
+### Verify it yourself, with tools this project does not control
 
-The strongest check is not a transcript we wrote. Ask the chat a question, then go read the
-database by hand:
-
-```bash
-uv run t2s db path 536c7b02                      # the short id the chat prints
-uv run t2s db path 536c7b02 --sql "SELECT ..."   # a ready-to-run, read-only sqlite3 command
-```
-
-Paste the SQL the chat showed you and compare the rows. `sqlite3` is also in the container image
-for exactly this, so the same move works against the containerised stack:
+A system reporting that its own answers are correct is not evidence. So take the database away
+from it:
 
 ```bash
-docker compose run --rm --entrypoint sh chat -c \
-  'sqlite3 -readonly -header -box /data/sample_dbs/536c7b02*.sqlite3 "SELECT ..."'
+uv run t2s db export 536c7b02 --out ~/Desktop/league.sqlite3
 ```
 
-The generated command is always `-readonly`: an independent check must never be the thing that
-mutates the data it is checking.
+That writes an ordinary SQLite file. Open it in **DB Browser for SQLite**, or the stock `sqlite3`
+shell, or anything else — nothing downstream of that file knows this project exists. Paste in the
+SQL the chat showed you and compare the rows yourself.
+
+From the containerised stack, mount a directory you own and export into it:
+
+```bash
+docker compose run --rm -v "$PWD:/export" --entrypoint t2s chat \
+  db export 536c7b02 --out /export/league.sqlite3
+```
+
+The export uses SQLite's `VACUUM INTO` rather than a file copy, so it is a consistent snapshot
+taken through SQLite itself — a database mid-write cannot produce a torn file. The source is opened
+read-only and is never modified.
+
+If you would rather not use our command at all, the file is just sitting there:
+`~/.t2s/sample_dbs/<id>.sqlite3` locally, or `docker cp` out of the `sample_dbs` volume. Copy it
+with `cp`. That is the strongest form of the check, and it needs nothing from us.
 
 ### Tier 2 — when a sample database has data
 
