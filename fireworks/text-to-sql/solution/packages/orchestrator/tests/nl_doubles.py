@@ -131,6 +131,7 @@ def directive_payload(
     text: str | None = None,
     row_count: int | None = None,
     model_ref: str | None = None,
+    delete_scope: str = "unspecified",
     referent: str = "none",
     rationale: str = "test",
 ) -> dict[str, Any]:
@@ -141,6 +142,7 @@ def directive_payload(
             "inspect_target": inspect_target,
             "table": table,
             "model_ref": model_ref,
+            "delete_scope": delete_scope,
             "row_count": row_count,
             "seed": None,
             "text": text,
@@ -171,6 +173,7 @@ def router_payload(
     text: str | None = None,
     row_count: int | None = None,
     model_ref: str | None = None,
+    delete_scope: str = "unspecified",
     referent: str = "none",
     rationale: str = "test",
     clarifying_question: str | None = None,
@@ -186,8 +189,12 @@ def router_payload(
             row_count=row_count,
             # Forwarded, deliberately and explicitly: a wrapper that accepts an
             # argument and quietly drops it is the bug that orphaned every
-            # fixture it touched, twice in this project.
+            # fixture it touched, twice in this project. `delete_scope` (W18) is
+            # the newest one to get this treatment, and it decides how much gets
+            # deleted -- a wrapper that swallowed it would silently narrow every
+            # scripted model deletion to a database deletion.
             model_ref=model_ref,
+            delete_scope=delete_scope,
             referent=referent,
             rationale=rationale,
         ),

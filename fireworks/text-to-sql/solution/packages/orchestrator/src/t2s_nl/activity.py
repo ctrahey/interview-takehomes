@@ -56,15 +56,24 @@ __all__ = [
 logger = logging.getLogger("t2s_nl.activity")
 
 #: Every kind this package emits. D14 named eight; W17 added four for the
-#: destructive lifecycle. The tuple is asserted against the instrumentation in
-#: the test suite so a new step cannot be added without the taxonomy growing to
-#: match.
+#: destructive lifecycle and W18 two more. The tuple is asserted against the
+#: instrumentation in the test suite so a new step cannot be added without the
+#: taxonomy growing to match.
 #:
-#: The four W17 kinds are a pair of pairs, and the split is deliberate:
+#: The W17 kinds are a pair of pairs, and the split is deliberate:
 #: ``confirm.request``/``confirm.resolve`` record the *permission* -- what was
 #: described to the user and what they said about it -- while ``db.clear`` and
 #: ``db.destroy`` record the *act*. Reading only the second pair would tell you
 #: a database was deleted and not that anyone agreed to it.
+#:
+#: W18 keeps that shape for the larger deletion. ``model.destroy`` is the act,
+#: and it is a **separate kind from ``db.destroy`` rather than a flag on it**,
+#: because ``/log`` has to make the two visibly different sizes of event: one
+#: removed a sample database, the other removed a design and everything derived
+#: from it. ``confirm.scope`` records the step before the permission -- the
+#: question "did you mean the model or its database?" -- so a transcript shows
+#: that the scope was asked for and by whom it was settled, not just what was
+#: eventually confirmed.
 ACTIVITY_KINDS: tuple[str, ...] = (
     "router.classify",
     "schema.generate",
@@ -75,9 +84,11 @@ ACTIVITY_KINDS: tuple[str, ...] = (
     "query.execute",
     "corrective.record",
     "confirm.request",
+    "confirm.scope",
     "confirm.resolve",
     "db.clear",
     "db.destroy",
+    "model.destroy",
     "database.export",
 )
 
@@ -92,9 +103,11 @@ KIND_LABELS: Mapping[str, str] = {
     "query.execute": "running the query",
     "corrective.record": "recording that",
     "confirm.request": "asking you to confirm",
+    "confirm.scope": "asking what exactly you want deleted",
     "confirm.resolve": "resolving that confirmation",
     "db.clear": "clearing the sample data",
     "db.destroy": "destroying the sample database",
+    "model.destroy": "deleting the data model and everything derived from it",
     "database.export": "saving a copy of the sample database",
 }
 

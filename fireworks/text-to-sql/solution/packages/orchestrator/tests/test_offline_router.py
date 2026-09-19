@@ -31,7 +31,7 @@ from t2s_core.errors import (
     TruncatedResponse,
     UpstreamError,
 )
-from t2s_nl import chat, offline_router
+from t2s_nl import chat, confirmation, offline_router
 from t2s_nl.clients import (
     NO_MODEL_AVAILABLE,
     DeferredFireworksClient,
@@ -508,3 +508,86 @@ def test_nothing_in_the_keyword_path_touches_an_inference_client(store: Store) -
     turns = orch.execute_plan(plan, "what models do I have?")
     assert turns[0].deterministic_answer
     assert OFFLINE_ROUTING_NOTE in turns[0].notes
+
+
+# ---------------------------------------------------------------------------
+# W18: model deletion is routable offline, and the scope is not guessed at
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("utterance", "scope"),
+    [
+        ("delete the sports league model", "model"),
+        ("remove the sports league data model", "model"),
+        ("drop the bookstore design", "model"),
+        ("get rid of that data model", "model"),
+        ("delete the sports league database", "database"),
+        ("get rid of that sample database entirely", "database"),
+        ("delete that database", "database"),
+        # Both cue families fire, and there is no honest keyword way to rank
+        # them -- so the scope is left open and the orchestrator asks, which it
+        # can do with no model at all.
+        ("delete the sports league model and its database", "unspecified"),
+        ("remove the bookstore data model and the db", "unspecified"),
+    ],
+)
+def test_the_keyword_router_fills_in_the_delete_scope(utterance: str, scope: str) -> None:
+    """Routing a deletion destroys nothing, so keyword-routing it is safe.
+
+    What is *not* safe is picking between the model and its database on a cue,
+    which is why the last two cases resolve to ``"unspecified"`` rather than to
+    whichever pattern happened to be listed first.
+    """
+    plan = classify(utterance, context=LOADED_CONTEXT)
+    assert plan.intents == ("destroy",)
+    assert plan.directives[0].parameters.delete_scope == scope
+    assert plan.routed_by == "keyword"
+
+
+def test_a_model_deletion_still_names_what_it_is_about() -> None:
+    plan = classify("delete the sports league data model", context=LOADED_CONTEXT)
+    assert plan.directives[0].parameters.model_ref == "sports league"
+
+
+def test_clearing_beats_nothing_and_a_mixed_verb_still_asks() -> None:
+    """The W17 destroy/clear ambiguity is unaffected by W18's new cue table."""
+    plan = classify("clear out the sports league model, just totally delete it")
+    assert plan.intents == ("unknown",)
+    assert plan.clarifying_question is not None
+    assert "EMPTIED" in plan.clarifying_question
+
+
+@pytest.mark.parametrize(
+    ("utterance", "scope"),
+    [
+        ("both", "both"),
+        ("Both, please", "both"),
+        ("everything", "both"),
+        ("the model and the database", "both"),
+        ("the model", "model"),
+        ("just the model", "model"),
+        ("the sports league model", "model"),
+        ("the design", "model"),
+        ("just the database", "database"),
+        ("the database", "database"),
+        ("keep the model", "database"),
+    ],
+)
+def test_a_scope_answer_is_read_in_code(utterance: str, scope: str) -> None:
+    assert confirmation.read_scope(utterance) == scope
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        "yes",
+        "no",
+        "",
+        "what models do I have?",
+        "wait - which one do you mean?",
+        "not yet",
+        "purple monkey dishwasher",
+    ],
+)
+def test_anything_that_is_not_one_of_the_three_is_not_a_scope(utterance: str) -> None:
+    """Same asymmetry as the yes/no reader: unsure resolves away from deleting more."""
+    assert confirmation.read_scope(utterance) is None

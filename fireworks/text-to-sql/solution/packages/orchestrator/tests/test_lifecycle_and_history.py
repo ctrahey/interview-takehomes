@@ -101,7 +101,14 @@ def test_the_transcript_that_prompted_this(store: Store, sample_db_dir: Path) ->
     intent it could become. The second is the one that matters more -- after the
     request, the file is still there.
     """
-    orch = _seeded(store, router_payload("destroy", model_ref="sports league"))
+    # `delete_scope="database"` is what the live router now returns for this
+    # wording -- the user said "database". W18 makes that a slot the model
+    # fills in rather than something the orchestrator infers, and leaving it
+    # unspecified is a different (and also correct) turn, covered in
+    # `test_model_deletion.py`.
+    orch = _seeded(
+        store, router_payload("destroy", model_ref="sports league", delete_scope="database")
+    )
     database_id = _current_database(orch)
     assert sample_db.exists(database_id)
 

@@ -13,6 +13,8 @@ Submodules:
 - `foundation.db` -- engine/session factory for foundation's own metadata store.
 - `foundation.bootstrap` -- default project/session (MAIN.md clarification 2).
 - `foundation.repositories` -- thin typed data-access layer.
+- `foundation.deletion` -- deleting a `DataModel` and everything derived from
+  it, and enumerating that cost in advance (W18).
 - `foundation.paths` / `foundation.security` / `foundation.sample_db` --
   the sample database lifecycle and its D9 security guarantees.
 - `foundation.examples` -- the out-of-the-box example schema library (W11):

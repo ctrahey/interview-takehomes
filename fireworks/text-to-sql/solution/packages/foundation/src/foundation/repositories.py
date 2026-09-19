@@ -546,6 +546,7 @@ class PendingActionRepository:
         action: str,
         description: str,
         database_id: uuid.UUID | None = None,
+        data_model_id: uuid.UUID | None = None,
         detail: dict[str, Any] | None = None,
         requested_seq: int | None = None,
         at: datetime | None = None,
@@ -557,6 +558,7 @@ class PendingActionRepository:
         row.action = action
         row.description = description
         row.database_id = database_id
+        row.data_model_id = data_model_id
         row.detail = detail
         row.requested_seq = requested_seq
         row.requested_at = at or datetime.now(UTC)

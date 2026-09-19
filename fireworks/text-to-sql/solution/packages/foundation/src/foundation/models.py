@@ -426,6 +426,14 @@ class PendingAction(Base):
     B. `requested_seq` pins the request to the activity row that described it,
     so the log and the pending state cannot disagree about which destruction was
     approved.
+
+    W18 adds a second kind of row to the same table, and the distinction is
+    carried entirely by `action`. `destroy` / `destroy_model` / `clear_data` are
+    *permissions*: an affirmative next turn executes them. `destroy_scope` is a
+    *question* -- "did you mean the model or its database?" -- and is answered
+    with a scope, never with a yes. Nothing consumes it as consent, because the
+    handler for a destructive action only ever acts on a row whose `action` is
+    that exact action.
     """
 
     __tablename__ = "pending_actions"
@@ -436,6 +444,14 @@ class PendingAction(Base):
     action: Mapped[str] = mapped_column(String(32), nullable=False)
     database_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("databases.id"), nullable=True
+    )
+    #: W18. A destructive request names a database, a data model, or (while the
+    #: scope question is outstanding) a model whose scope is not settled yet.
+    #: Two nullable columns rather than one polymorphic id, because a foreign
+    #: key that sometimes points at another table is a foreign key the database
+    #: cannot check -- and this row's entire purpose is to be trustworthy.
+    data_model_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("data_models.id"), nullable=True
     )
     #: The exact sentence the user was shown. Replayed verbatim on confirmation
     #: so what is destroyed is what was described, not a re-derivation of it.

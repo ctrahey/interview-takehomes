@@ -15,8 +15,9 @@ Two groups are captured:
   whole conversation.
 * **scenarios** -- whole conversations driven through ``Orchestrator.handle``:
   the money path (describe → DDL → database → data → question → SQL → run), a
-  corrective, and two prompt-injection attempts. These record every call the
-  path makes, including ``t2s_core``'s generation and repair turns.
+  corrective, the W18 model-deletion lifecycle (Chris's own three utterances),
+  and the prompt-injection attempts. These record every call the path makes,
+  including ``t2s_core``'s generation and repair turns.
 
 The key is read as opaque data and held in a ``SecretStr``. It is never printed.
 """
@@ -42,8 +43,10 @@ from t2s_nl.orchestrator import Orchestrator
 from t2s_nl.router import route
 from t2s_nl.scenarios import (
     CONTEXTS,
+    LIFECYCLE_SCRIPT,
     MONEY_PATH,
     ROUTER_CASES,
+    ROUTER_SCOPE_CASES,
     SECURITY_SCRIPTS,
 )
 from t2s_nl.store import Store
@@ -101,6 +104,7 @@ def capture_router(client: CachingRecorder) -> int:
     """
     print(f"router: {len(ROUTER_CASES)} utterances x {len(CONTEXTS)} contexts")
     diffs = 0
+    scopes: dict[tuple[str, str], str] = {}
     for utterance, context_name, expected in ROUTER_CASES:
         # Capture EVERY utterance against EVERY canonical context, not just the
         # one the case declares. The router context is part of the prompt, so an
@@ -131,7 +135,22 @@ def capture_router(client: CachingRecorder) -> int:
         print(
             f"  {flag} {utterance[:52]:<54} -> {shown or '(none)'} (wanted {' -> '.join(expected)})"
         )
+        scopes[utterance, context_name] = (
+            plan.directives[0].parameters.delete_scope if (plan.directives) else "unspecified"
+        )
     print(f"  router: {len(ROUTER_CASES) - diffs}/{len(ROUTER_CASES)} matched")
+
+    # W18. The scope is a parameter rather than an intent, so it would be
+    # invisible in the table above -- and it is the whole of what W18 added to
+    # the router. Reported here so a prompt regression on model-versus-database
+    # shows up at capture time, which is where every other routing regression in
+    # this project has been caught.
+    print(f"\nrouter scope: {len(ROUTER_SCOPE_CASES)} destroy utterances")
+    for utterance, context_name, expected_scope in ROUTER_SCOPE_CASES:
+        got_scope = scopes.get((utterance, context_name), "(not routed)")
+        flag = "ok " if got_scope == expected_scope else "DIFF"
+        diffs += got_scope != expected_scope
+        print(f"  {flag} {utterance[:52]:<54} -> {got_scope} (wanted {expected_scope})")
     return diffs
 
 
@@ -165,6 +184,7 @@ def main() -> int:
 
     diffs = capture_router(client)
     capture_scenario(client, "money-path", MONEY_PATH)
+    capture_scenario(client, "lifecycle-model-deletion", LIFECYCLE_SCRIPT)
     for name, utterances in SECURITY_SCRIPTS.items():
         capture_scenario(client, name, utterances)
 

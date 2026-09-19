@@ -16,7 +16,14 @@ import pytest
 from t2s_nl.clients import offline_client
 from t2s_nl.intents import WIRE_INTENTS
 from t2s_nl.router import RouterContext, route
-from t2s_nl.scenarios import CONTEXTS, EMPTY_CONTEXT, LOADED_CONTEXT, RECALL_CONTEXT, ROUTER_CASES
+from t2s_nl.scenarios import (
+    CONTEXTS,
+    EMPTY_CONTEXT,
+    LOADED_CONTEXT,
+    RECALL_CONTEXT,
+    ROUTER_CASES,
+    ROUTER_SCOPE_CASES,
+)
 
 
 def _context(name: str) -> RouterContext:
@@ -33,6 +40,27 @@ def test_router_picks_the_right_plan(
 ) -> None:
     plan = route(utterance, client=offline_client(), context=_context(context_name))
     assert plan.intents == expected
+
+
+@pytest.mark.parametrize(
+    ("utterance", "context_name", "scope"),
+    ROUTER_SCOPE_CASES,
+    ids=[u[:40].replace(" ", "-") for u, _, _ in ROUTER_SCOPE_CASES],
+)
+def test_the_router_says_whether_the_model_or_the_database_is_meant(
+    utterance: str, context_name: str, scope: str
+) -> None:
+    """W18. Model-versus-database is a parameter, so it needs its own table.
+
+    The intent table above would pass whether the live model answered "delete
+    the sports model" with `delete_scope="model"` or with `"database"` -- both
+    are `("destroy",)`. The scope is the whole of what W18 added to the router,
+    and it is also the difference between removing a sample database and
+    removing a design, so it is asserted against the captured answers directly.
+    """
+    plan = route(utterance, client=offline_client(), context=_context(context_name))
+    assert plan.intents == ("destroy",)
+    assert plan.primary.parameters.delete_scope == scope
 
 
 def test_chris_examples_resolve_to_the_right_deterministic_read() -> None:

@@ -33,9 +33,22 @@ from __future__ import annotations
 import re
 from typing import Final, Literal
 
-__all__ = ["AFFIRMATIVE_EXAMPLES", "Verdict", "read"]
+__all__ = [
+    "AFFIRMATIVE_EXAMPLES",
+    "SCOPE_EXAMPLES",
+    "Scope",
+    "Verdict",
+    "read",
+    "read_scope",
+]
 
 Verdict = Literal["affirmative", "negative", "unrelated"]
+
+#: The answer to "the model, its database, or both?" (W18). ``None`` is "that
+#: was not an answer to my question", and is handled exactly like
+#: ``"unrelated"`` above: the question is dropped, announced, and the utterance
+#: is routed normally.
+Scope = Literal["model", "database", "both"]
 
 
 def _compile(*patterns: str) -> tuple[re.Pattern[str], ...]:
@@ -84,6 +97,105 @@ _AFFIRMATIVE: Final = _compile(
 #: Shown in the confirmation prompt, so the user is told exactly what will work
 #: rather than having to guess at our vocabulary.
 AFFIRMATIVE_EXAMPLES: Final = '"yes", "do it", or "delete it"'
+
+
+#: W18. Read in code for the same three reasons a "yes" is: a scope answer
+#: decides how much gets deleted, a mislabelled enum must not be able to widen a
+#: deletion, and the whole flow has to work with no model behind it.
+#:
+#: Checked in this order, and the order is the safety argument. "both" and "the
+#: model" are checked before "the database", because every phrasing of the
+#: larger answer ("the model and the database", "all of it") contains a cue for
+#: the smaller one, and resolving that overlap the other way would silently
+#: shrink what the user asked for -- after which they would confirm a
+#: description that no longer matched their intent.
+_SCOPE_PATTERNS: Final[tuple[tuple[Scope, tuple[re.Pattern[str], ...]], ...]] = (
+    (
+        # Checked before everything else because these say which one to KEEP,
+        # and every one of them contains the cue for the other answer. "Keep the
+        # model" read as "model" would delete the thing the sentence asked to
+        # keep -- the worst misreading available in this function.
+        "database",
+        _compile(
+            r"\b(keep|leave|preserve|save|hang on to) (the |my )?(data )?model\b",
+            r"\bnot the (data )?model\b",
+        ),
+    ),
+    (
+        "both",
+        _compile(
+            r"^\s*both\b",
+            r"\bboth (of )?(them|it|those)\b",
+            r"\b(the )?(data )?model and (the |its )?(sample )?(database|db)\b",
+            r"\b(the )?(sample )?(database|db) and (the |its )?(data )?model\b",
+            r"^\s*(everything|all of it|the lot|the whole (lot|thing))\b",
+            r"\bdelete everything\b",
+        ),
+    ),
+    (
+        "model",
+        _compile(
+            r"\bthe (whole|entire) (data )?model\b",
+            r"^\s*(just |only )?the (data )?model\b",
+            r"\b(data )?model,? (please|itself)\b",
+            r"\b(just|only) the (data )?model\b",
+            r"\bthe (design|whole thing)\b",
+            r"\bthe (data )?model\b",
+        ),
+    ),
+    (
+        "database",
+        _compile(
+            r"^\s*(just |only )?the (sample )?(database|db|instance)\b",
+            r"\b(just|only) the (sample )?(database|db|instance)\b",
+            r"\b(sample )?(database|db|instance),? (please|only|itself)\b",
+            r"\b(keep|leave) the (data )?model\b",
+            r"\bthe (sample )?(database|db|instance)\b",
+        ),
+    ),
+)
+
+#: The last resort, and only when the two cues are **disjoint**. "the sports
+#: league model" is a plain scope answer that matches none of the phrasings
+#: above, because it names the thing instead of pointing at it.
+#:
+#: When both cue families appear and none of the explicit phrasings above fired,
+#: the answer is ``None``: the sentence mentions a model and a database in some
+#: arrangement we have no pattern for, and there is no safe way to rank them.
+#: Re-asking costs a turn; picking the larger one costs a data model.
+_MODEL_CUE: Final = re.compile(r"\b(data ?)?models?\b|\bdesigns?\b", re.IGNORECASE)
+_DATABASE_CUE: Final = re.compile(r"\b(databases?|dbs?|instances?)\b", re.IGNORECASE)
+
+#: Shown with the scope question, so the vocabulary is stated rather than guessed at.
+SCOPE_EXAMPLES: Final = '"the model", "just the database", or "both"'
+
+
+def read_scope(utterance: str) -> Scope | None:
+    """Read one utterance as an answer to "the model, the database, or both?".
+
+    Returns ``None`` for anything that is not clearly one of the three. A scope
+    answer is not consent and never deletes anything on its own -- it produces
+    the confirmation for that scope, which still has to be agreed to -- but it
+    *does* choose how large the thing being described is, so the same
+    "when in doubt, it was not an answer" rule applies.
+
+    A question is never an answer, for the reason found by driving W17 live:
+    "wait - which model?" is the user asking, and swallowing it as a choice
+    would lose the question and pick a scope they never named.
+    """
+    text = utterance.replace("\u2019", "'").strip()
+    if not text or _ASKS_SOMETHING.search(text):
+        return None
+    if any(p.search(text) for p in _NEGATIVE):
+        return None
+    for scope, patterns in _SCOPE_PATTERNS:
+        if any(p.search(text) for p in patterns):
+            return scope
+    model_cue = bool(_MODEL_CUE.search(text))
+    database_cue = bool(_DATABASE_CUE.search(text))
+    if model_cue != database_cue:
+        return "model" if model_cue else "database"
+    return None
 
 
 def read(utterance: str) -> Verdict:

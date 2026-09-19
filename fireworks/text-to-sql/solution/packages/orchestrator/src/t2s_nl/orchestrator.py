@@ -64,7 +64,7 @@ from typing import Any, cast
 from sqlalchemy.orm import Session as OrmSession
 
 from foundation import ddl as ddl_module
-from foundation import paths, sample_db, security
+from foundation import deletion, paths, sample_db, security
 from foundation.graph import EntityGraph
 from foundation.models import DataModel, Query, Schema, SessionState
 from foundation.repositories import (
@@ -95,7 +95,7 @@ from t2s_nl import history as history_module
 from t2s_nl.activity import ActivityEmitter, ActivityListener
 from t2s_nl.clients import NO_MODEL_AVAILABLE
 from t2s_nl.correctives import compose_session_summary
-from t2s_nl.intents import Directive, Intent, Parameters, Plan
+from t2s_nl.intents import DeleteScope, Directive, Intent, Parameters, Plan
 from t2s_nl.offline_router import OFFLINE_ROUTING_NOTE
 from t2s_nl.router import RouterContext, no_model_reason, route
 from t2s_nl.store import Store
@@ -122,8 +122,6 @@ _CANCELLED_NOTE = (
 )
 
 
-#: The verb each destructive action is described with, in one place so the
-#: confirmation prompt, the log summary and the cancellation note agree.
 #: Where `export` writes. Overridable so a container can aim it at a mounted
 #: host directory (`T2S_EXPORT_DIR=/export`), which is what makes the copy
 #: reachable from outside the container at all.
@@ -133,7 +131,47 @@ def _export_destination(database_id: uuid.UUID) -> Path:
     return directory / f"{database_id.hex[:8]}.sqlite3"
 
 
-_VERB: dict[str, str] = {"destroy": "destroy", "clear_data": "clear the data from"}
+#: The verb each destructive action is described with, in one place so the
+#: confirmation prompt, the log summary and the cancellation note agree.
+_VERB: dict[str, str] = {
+    "destroy": "destroy",
+    "clear_data": "clear the data from",
+    # "delete", not "delete the data model": the cancellation note pairs the verb
+    # with a subject that already says what kind of thing it is ("the data model
+    # 'sports-league'"), and the longer verb made it read "delete the data model
+    # the data model 'sports-league'". Found by driving it.
+    "destroy_model": "delete",
+    # Not a destructive action at all -- the pending row that carries the
+    # question "model or database?" (W18). It appears here only because the
+    # cancellation note has to be able to word it.
+    "destroy_scope": "delete",
+}
+
+#: Which pending actions each destructive intent is allowed to consume (W18).
+#: ``destroy`` covers two very different deletions, so the intent alone cannot
+#: say which permission was granted -- the *pending row* does, and this table is
+#: the only place the two are connected. ``destroy_scope`` is deliberately
+#: absent from every entry: a scope answer is not consent and no handler may act
+#: on it.
+_PENDING_ACTIONS: dict[str, tuple[str, ...]] = {
+    "destroy": ("destroy", "destroy_model"),
+    "clear_data": ("clear_data",),
+}
+
+#: The intent a pending action belongs to, for rebuilding a directive from it.
+_INTENT_OF: dict[str, Intent] = {
+    "destroy": "destroy",
+    "destroy_model": "destroy",
+    "clear_data": "clear_data",
+}
+
+#: The ``delete_scope`` each pending destructive action implies, so a directive
+#: rebuilt from a confirmed permission carries the scope it was granted for.
+_SCOPE_OF: dict[str, str] = {
+    "destroy": "database",
+    "destroy_model": "model",
+    "clear_data": "unspecified",
+}
 
 #: Backstop for the one boundary this package will not cross: a directive that
 #: got as far as a generation call with no model behind it. The keyword router
@@ -211,6 +249,10 @@ class _Pending:
     database_id: uuid.UUID | None
     description: str
     detail: dict[str, Any]
+    #: W18. Set for ``destroy_model`` and for the ``destroy_scope`` question;
+    #: ``None`` for a database-scoped action. Two nullable columns rather than
+    #: one untyped id -- see ``foundation.models.PendingAction``.
+    data_model_id: uuid.UUID | None = None
 
 
 class Orchestrator:
@@ -429,8 +471,8 @@ class Orchestrator:
             # unless a pending confirmation for exactly this action already
             # exists -- which `plan()` guarantees only happens after the user
             # said yes to it.
-            "destroy": lambda: self._lifecycle(directive, action="destroy"),
-            "clear_data": lambda: self._lifecycle(directive, action="clear_data"),
+            "destroy": lambda: self._lifecycle(directive, intent="destroy"),
+            "clear_data": lambda: self._lifecycle(directive, intent="clear_data"),
             "export": partial(self._export, directive),
             "cancel": self._cancel_pending,
         }
@@ -969,50 +1011,148 @@ class Orchestrator:
     # field" is a weaker guarantee than "the permission lives in a different
     # table, written by us, in the previous turn".
 
-    def _lifecycle(self, directive: Directive, *, action: str) -> Turn:
+    def _lifecycle(self, directive: Directive, *, intent: Intent) -> Turn:
         """Either perform a confirmed destruction, or describe one and ask."""
         pending = self._read_pending()
-        if pending is not None and pending.action == action:
+        if pending is not None and pending.action in _PENDING_ACTIONS[intent]:
             return self._perform(pending)
         if pending is not None:  # pragma: no cover - `plan()` clears these first
             self._drop_pending("a different destructive request replaced it")
-        return self._request_confirmation(directive, action=action)
+        return self._request_confirmation(directive, intent=intent)
 
-    def _request_confirmation(self, directive: Directive, *, action: str) -> Turn:
+    def _request_confirmation(self, directive: Directive, *, intent: Intent) -> Turn:  # noqa: PLR0911
         """Turn one: say exactly what would be lost, record the request, do nothing.
 
         "Exactly" is the whole job. "Delete the database?" is not a confirmation
         anybody can give meaningfully; "database 3f2a91b4, built from data model
         'sports-league', 142 rows across 5 tables" is. The counts are read from
         the file itself, not from what we believe we loaded.
+
+        W18 adds a branch *before* any of that. ``destroy`` can now mean the data
+        model rather than one of its databases, and when the user named something
+        without saying which, there is no description to give yet -- the two
+        candidate descriptions differ by an entire database. That case asks
+        first (:class:`lifecycle.NeedsScope`) and describes second, which is two
+        questions in a row and is correct: the first settles *what*, the second
+        gets consent for *how much*.
         """
-        intent = cast("Intent", action)
         named = (directive.parameters.model_ref or "").strip() or None
+        scope = directive.parameters.delete_scope if intent == "destroy" else "database"
         with self.store.scope() as db:
             pointers = self._pointers(db)
-            resolution = lifecycle.resolve(
-                db,
-                self.store.project_id,
-                named=named,
-                current_database_id=pointers.database_id,
+            resolution = (
+                lifecycle.resolve_destroy(
+                    db,
+                    self.store.project_id,
+                    named=named,
+                    scope=scope,
+                    current_database_id=pointers.database_id,
+                    current_model_id=pointers.data_model_id,
+                )
+                if intent == "destroy"
+                else lifecycle.resolve(
+                    db,
+                    self.store.project_id,
+                    named=named,
+                    current_database_id=pointers.database_id,
+                )
+            )
+            # A model's blast radius means reading every sample database
+            # underneath it, so it needs the session -- and computing it here
+            # keeps the description inside the transaction that resolved the
+            # target, rather than describing a world that moved in between.
+            described = (
+                lifecycle.describe_model(db, resolution)
+                if isinstance(resolution, lifecycle.ModelTarget)
+                else None
             )
 
         if isinstance(resolution, lifecycle.NotFound):
             return Turn.ask(
-                _no_target_message(resolution, action),
+                _no_target_message(resolution, intent, scope),
                 intent=intent,
-                table=_options_table(resolution.available),
+                table=_options_table(resolution.available)
+                or _model_options_table(resolution.models),
             )
         if isinstance(resolution, lifecycle.Ambiguous):
             return Turn.ask(
-                f"I could {_VERB[action]} more than one thing there, and I won't guess which "
-                f"— {_VERB[action]} is not undoable. Which of these did you mean? Say the "
-                "model's name.",
+                f"I could {_VERB[intent]} more than one thing there, and I won't guess "
+                f"which — {_VERB[intent]} is not undoable. Which of these did you mean? "
+                "Say its name.",
                 intent=intent,
-                table=_options_table(resolution.options),
+                table=_options_table(resolution.options) or _model_options_table(resolution.models),
             )
+        if isinstance(resolution, lifecycle.NeedsScope):
+            return self._ask_scope(resolution, intent=intent)
+        if isinstance(resolution, lifecycle.ModelTarget) and described is not None:
+            return self._confirm_model(resolution, *described)
+        if isinstance(resolution, lifecycle.Target):
+            return self._confirm_database(resolution, action=intent)
+        return Turn.ask(  # pragma: no cover - every Resolution member is handled above
+            "I could not work out what you wanted deleted.", intent=intent
+        )
 
-        target = resolution
+    def _ask_scope(self, resolution: lifecycle.NeedsScope, *, intent: Intent) -> Turn:
+        """The question Chris's session asked well and could not then honour (W18).
+
+        It is a :class:`foundation.models.PendingAction` like a confirmation, in
+        the same table, and it is deliberately **not** a permission: its action
+        is ``destroy_scope``, and no destructive handler will act on a pending
+        row whose action is not that handler's own. Answering it produces a
+        description and a *second* question. A scope is not consent, and the
+        blast radius of "both" was never on screen when the scope was asked for.
+        """
+        model = resolution.model
+        subject = f"{model.label} or its sample database"
+        ids = ", ".join(t.short_id for t in resolution.databases)
+        # Deliberately terse. `render.MAX_CELL` truncates a table cell at 40
+        # characters, so a cell that carries the argument gets its argument cut
+        # off mid-word -- found by driving it. The detail belongs in the
+        # sentence, which is not truncated; the table is the menu.
+        rows = [
+            ["the model", "the design and everything under it"],
+            ["just the database", f"{ids} — the design survives"],
+            ["both", "the same as 'the model'"],
+        ]
+        with (
+            self.activity.step(
+                "confirm.scope",
+                summary=f"asking whether you meant the model {model.name!r} or its database",
+                detail={
+                    "named": resolution.named,
+                    "data_model": model.name,
+                    "databases": [str(t.database_id) for t in resolution.databases],
+                    history_module.SUBJECT_KEY: model.label,
+                },
+            ) as step,
+            self.store.scope() as db,
+        ):
+            PendingActionRepository(db).request(
+                self.store.session_id,
+                action="destroy_scope",
+                description=subject,
+                data_model_id=model.data_model_id,
+                detail={
+                    "named": resolution.named,
+                    "model": model.name,
+                    history_module.SUBJECT_KEY: subject,
+                },
+                requested_seq=step.begin_seq,
+            )
+        return Turn.ask(
+            f"{resolution.named!r} names the data model {model.name!r} — "
+            f"{model.version_count} version(s), its schema(s), and "
+            f"{model.database_count} sample database(s) ({ids}). "
+            '"The model" and "its database" are very different deletions, and I '
+            f"won't guess. Which did you mean? Reply {confirmation.SCOPE_EXAMPLES}. "
+            "Nothing has been changed, and I'll show you exactly what would go "
+            "before anything does.",
+            intent=intent,
+            table=DataTable(columns=["answer", "what it deletes"], rows=rows),
+        )
+
+    def _confirm_database(self, target: lifecycle.Target, *, action: str) -> Turn:
+        """W17's confirmation, unchanged: one sample database, described from its file."""
         table, total = lifecycle.describe(target)
         description = _describe_consequence(action, target, total)
         with (
@@ -1046,7 +1186,62 @@ class Orchestrator:
             f"{description} Nothing has been changed yet — reply "
             f"{confirmation.AFFIRMATIVE_EXAMPLES} and I'll do it; say anything else and "
             "I'll leave it alone.",
-            intent=intent,
+            intent=cast("Intent", action),
+            table=table,
+        )
+
+    def _confirm_model(
+        self, target: lifecycle.ModelTarget, table: DataTable, losses: deletion.ModelDeletion
+    ) -> Turn:
+        """The larger confirmation, and the reason the description is enumerated (W18).
+
+        A model deletion is strictly bigger than a database deletion, so the
+        sentence names every kind of thing that goes and the table names each
+        one individually -- by id and row count for the databases, because "one
+        sample database" and "one sample database with 4,000 rows in it" are not
+        the same thing to agree to.
+
+        The counts also go into the pending row's detail, so that when the user
+        says yes the outcome can be compared against exactly what they were
+        shown. Nobody should confirm a deletion whose size they were not told.
+        """
+        description = _describe_model_consequence(losses)
+        shape = _deletion_shape(losses)
+        with (
+            self.activity.step(
+                "confirm.request",
+                summary=(
+                    f"awaiting your confirmation to delete data model {losses.name!r} "
+                    f"and all {sum(shape.values())} thing(s) derived from it"
+                ),
+                detail={
+                    "action": "destroy_model",
+                    "data_model": str(target.data_model_id),
+                    "model": losses.name,
+                    "databases": [str(d.database_id) for d in losses.databases],
+                    "shape": shape,
+                    history_module.SUBJECT_KEY: target.label,
+                },
+            ) as step,
+            self.store.scope() as db,
+        ):
+            PendingActionRepository(db).request(
+                self.store.session_id,
+                action="destroy_model",
+                description=description,
+                data_model_id=target.data_model_id,
+                detail={
+                    "model": losses.name,
+                    "shape": shape,
+                    history_module.SUBJECT_KEY: target.label,
+                },
+                requested_seq=step.begin_seq,
+            )
+        return Turn.ask(
+            f"{description} Nothing has been changed yet — reply "
+            f"{confirmation.AFFIRMATIVE_EXAMPLES} and I'll do it; say anything else and "
+            "I'll leave it alone.",
+            intent="destroy",
             table=table,
         )
 
@@ -1058,7 +1253,7 @@ class Orchestrator:
         re-trigger; making the user ask again is the cheap failure.
         """
         action = pending.action
-        intent = cast("Intent", action)
+        intent = _INTENT_OF[action]
         subject = pending.detail.get(history_module.SUBJECT_KEY)
         with self.store.scope() as db:
             PendingActionRepository(db).clear(self.store.session_id)
@@ -1071,6 +1266,9 @@ class Orchestrator:
                 history_module.SUBJECT_KEY: subject,
             },
         )
+
+        if action == "destroy_model":
+            return self._do_destroy_model(pending)
 
         if pending.database_id is None:  # pragma: no cover - never written null
             return Turn.error(
@@ -1128,6 +1326,71 @@ class Orchestrator:
                 f"the data model {target.model_name!r} and its schema are untouched — "
                 "say 'load it with data' to build a fresh database from the same schema",
             ],
+            deterministic_answer=True,
+        )
+
+    def _do_destroy_model(self, pending: _Pending) -> Turn:
+        """Delete the model and everything derived from it (W18).
+
+        The cascade itself is `foundation.deletion.delete_data_model` -- rows,
+        files and every outside pointer into the subtree, in one transaction.
+        What is here is the part that belongs to a conversation: the log entry,
+        and checking that what actually went is what the user was shown. A
+        confirmation is a promise about size, so a mismatch between the promise
+        and the outcome is reported rather than glossed over.
+        """
+        model_id = pending.data_model_id
+        promised = pending.detail.get("shape")
+        if model_id is None:  # pragma: no cover - never written null for this action
+            return Turn.error(
+                "I've lost track of which data model that was. Ask again and I'll re-check.",
+                intent="destroy",
+            )
+        with self.activity.step(
+            "model.destroy",
+            summary=f"deleting data model {pending.detail.get('model') or model_id}",
+            detail={
+                "data_model": str(model_id),
+                "model": pending.detail.get("model"),
+                history_module.SUBJECT_KEY: pending.detail.get(history_module.SUBJECT_KEY),
+            },
+        ) as step:
+            with self.store.scope() as db:
+                losses = deletion.delete_data_model(db, model_id)
+            if losses is None:
+                step.summary = "that data model was already gone"
+                return Turn.error(
+                    "That data model is already gone, so there was nothing to do.",
+                    intent="destroy",
+                )
+            shape = _deletion_shape(losses)
+            step.summary = (
+                f"deleted data model {losses.name!r}: {losses.versions} version(s), "
+                f"{len(losses.schemas)} schema(s), {len(losses.databases)} sample "
+                f"database(s), {losses.total_rows} row(s)"
+            )
+            step.note(shape=shape, files_removed=len(losses.databases))
+
+        notes = [
+            f"{losses.queries_unlinked} saved quer(y/ies) you wrote against it are kept, "
+            "with their link to the deleted schema cleared"
+            if losses.queries_unlinked
+            else "nothing else in this project referred to it",
+        ]
+        if promised is not None and promised != shape:
+            # Between the description and the yes, the world moved. Say so:
+            # the confirmation was a statement about size, and it was wrong.
+            notes.append(
+                f"what I described was {_shape_words(promised)}; what I actually removed "
+                f"was {_shape_words(shape)} — something changed between the two turns"
+            )
+        return Turn(
+            intent="destroy",
+            text=(
+                f"Deleted data model {losses.name!r} and everything derived from it: "
+                f"{_shape_words(shape)}. The sample database file(s) are gone from disk too."
+            ),
+            notes=notes,
             deterministic_answer=True,
         )
 
@@ -1259,14 +1522,71 @@ class Orchestrator:
         pending = self._read_pending()
         if pending is None:
             return None, []
+
+        # W18. A scope question is answered with a scope, never with a yes, and
+        # it is checked first so that no reading of "yes" can ever consume it.
+        # The answer produces a *description* of that scope and a real
+        # confirmation; it destroys nothing by itself.
+        if pending.action == "destroy_scope":
+            return self._scope_plan(pending, utterance)
+
+        # W18. "Both" is the one word that cannot be a fresh instruction: it
+        # names nothing and commands nothing, so the only thing it can be is an
+        # answer, and the only answer it can be is "widen this to the model".
+        # Reading it as "you moved on" -- which is what every other unclear
+        # utterance gets -- is what made Chris's session dead-end, and it is a
+        # dead end whether the question that preceded it was the scope question
+        # or a database confirmation the user has decided is too small.
+        #
+        # Widening is not consent. It produces the *larger* description and a
+        # fresh confirmation, so nothing is deleted on a word that was never
+        # shown the blast radius it just asked for.
+        if confirmation.read_scope(utterance) == "both":
+            # The standing permission goes FIRST, and this is the whole of why
+            # widening is safe: without it the `destroy` directive below would
+            # find a live pending row of its own kind and read it as consent,
+            # turning the word "both" into an unconfirmed deletion. Clearing it
+            # means the next thing that happens is a description.
+            widened = pending.detail.get("model")
+            with self.store.scope() as db:
+                PendingActionRepository(db).clear(self.store.session_id)
+            self.activity.note(
+                "confirm.resolve",
+                summary="you asked for both, so I widened it to the data model",
+                detail={
+                    "action": pending.action,
+                    "outcome": "widened",
+                    "scope": "both",
+                    history_module.SUBJECT_KEY: pending.detail.get(history_module.SUBJECT_KEY),
+                },
+            )
+            return (
+                Plan(
+                    directives=[
+                        Directive(
+                            intent="destroy",
+                            parameters=Parameters(model_ref=widened, delete_scope="both"),
+                            rationale="you asked for both, which is the model",
+                        )
+                    ],
+                    confidence="high",
+                    routed_by="keyword",
+                    routing_note=CONFIRMATION_NOTE,
+                ),
+                [],
+            )
+
         verdict = confirmation.read(utterance)
         if verdict == "affirmative":
             return (
                 Plan(
                     directives=[
                         Directive(
-                            intent=cast("Intent", pending.action),
-                            parameters=Parameters(model_ref=pending.detail.get("model")),
+                            intent=_INTENT_OF[pending.action],
+                            parameters=Parameters(
+                                model_ref=pending.detail.get("model"),
+                                delete_scope=cast("DeleteScope", _SCOPE_OF[pending.action]),
+                            ),
                             rationale="you confirmed the pending request",
                         )
                     ],
@@ -1291,6 +1611,60 @@ class Orchestrator:
         note = self.invalidate_pending("you asked for something else instead")
         return None, [note] if note else []
 
+    def _scope_plan(self, pending: _Pending, utterance: str) -> tuple[Plan | None, list[str]]:
+        """Read this utterance as "the model", "just the database" or "both" (W18).
+
+        The three answers are all executable, which is the point of the cascade
+        decision: "both" is the model, because deleting the model already takes
+        its databases with it. The resulting plan is a ``destroy`` directive with
+        the chosen scope, which then goes through the ordinary confirmation
+        gate -- so the user still sees the blast radius of the scope they picked
+        and still has to agree to it.
+
+        Anything that is not one of the three drops the question (announced) and
+        is routed normally, exactly as an unclear answer to a yes/no does.
+        """
+        scope = confirmation.read_scope(utterance)
+        if scope is None:
+            note = self.invalidate_pending("you asked for something else instead")
+            return None, [note] if note else []
+
+        # The question is answered, so its row goes now. Leaving it for the
+        # destructive handler to trip over would log the answer as "a different
+        # destructive request replaced it", which is both wrong and exactly the
+        # kind of wrong a log is supposed to rule out.
+        named = pending.detail.get("named") or pending.detail.get("model")
+        with self.store.scope() as db:
+            PendingActionRepository(db).clear(self.store.session_id)
+        self.activity.note(
+            "confirm.resolve",
+            summary=f"you chose: {scope}",
+            detail={
+                "action": pending.action,
+                "outcome": "scope chosen",
+                "scope": scope,
+                history_module.SUBJECT_KEY: pending.detail.get(history_module.SUBJECT_KEY),
+            },
+        )
+        return (
+            Plan(
+                directives=[
+                    Directive(
+                        intent="destroy",
+                        parameters=Parameters(
+                            model_ref=named,
+                            delete_scope=cast("DeleteScope", scope),
+                        ),
+                        rationale="you told me which of the two you meant",
+                    )
+                ],
+                confidence="high",
+                routed_by="keyword",
+                routing_note=CONFIRMATION_NOTE,
+            ),
+            [],
+        )
+
     def _read_pending(self) -> _Pending | None:
         with self.store.scope() as db:
             row = PendingActionRepository(db).get(self.store.session_id)
@@ -1301,6 +1675,7 @@ class Orchestrator:
                 database_id=row.database_id,
                 description=row.description,
                 detail=dict(row.detail or {}),
+                data_model_id=row.data_model_id,
             )
 
     def _drop_pending(self, reason: str) -> _Pending | None:
@@ -1513,6 +1888,85 @@ def _describe_consequence(action: str, target: lifecycle.Target, total_rows: int
     )
 
 
+def _describe_model_consequence(losses: deletion.ModelDeletion) -> str:
+    """One paragraph naming everything a model deletion takes with it (W18).
+
+    Enumerated rather than summarised, and the enumeration is the point: a user
+    must never confirm a deletion whose size they were not shown, and a model
+    deletion is strictly larger than the database deletion W17 described. Each
+    sample database is named by id and by how many rows are in it *right now*,
+    read from the file rather than from what we believe we loaded.
+
+    The one thing that survives is stated too, because "your saved queries are
+    kept" is exactly the sort of thing a user would otherwise assume the worst
+    about -- and the sentence that only lists losses trains people to skim it.
+    """
+    if losses.is_empty:
+        return (
+            f"That would delete the data model {losses.name!r}. Nothing has been built "
+            "from it yet — no versions, no schemas, no sample databases — so it is the "
+            "model row and nothing else."
+        )
+    parts = [f"{losses.versions} version(s)"]
+    if losses.schemas:
+        parts.append(
+            f"{len(losses.schemas)} schema(s) (" + ", ".join(s.label for s in losses.schemas) + ")"
+        )
+    if losses.databases:
+        parts.append(
+            f"{len(losses.databases)} sample database(s) ("
+            + ", ".join(d.label for d in losses.databases)
+            + "), files and all"
+        )
+    if losses.datasets:
+        parts.append(f"{len(losses.datasets)} saved dataset(s) ({', '.join(losses.datasets)})")
+    if losses.correctives:
+        parts.append(f"{losses.correctives} corrective(s) recorded against it")
+
+    kept = (
+        f" Your {losses.queries_unlinked} saved quer(y/ies) written against it are kept — "
+        "the SQL stays, its link to the deleted schema does not."
+        if losses.queries_unlinked
+        else ""
+    )
+    return (
+        f"That would permanently delete the data model {losses.name!r} and everything "
+        f"derived from it: {'; '.join(parts)}. {losses.total_rows} row(s) go with it. "
+        f"This cannot be undone.{kept}"
+    )
+
+
+def _deletion_shape(losses: deletion.ModelDeletion) -> dict[str, int]:
+    """The confirmation's promise about size, as comparable numbers.
+
+    Stored on the pending row and recomputed after the deletion, so "what you
+    were shown" and "what happened" can be checked against each other rather
+    than assumed equal.
+    """
+    return {
+        "versions": losses.versions,
+        "schemas": len(losses.schemas),
+        "databases": len(losses.databases),
+        "datasets": len(losses.datasets),
+        "correctives": losses.correctives,
+        "rows": losses.total_rows,
+    }
+
+
+def _shape_words(shape: dict[str, int]) -> str:
+    return ", ".join(f"{shape.get(k, 0)} {k}" for k in _SHAPE_ORDER)
+
+
+_SHAPE_ORDER: tuple[str, ...] = (
+    "versions",
+    "schemas",
+    "databases",
+    "datasets",
+    "correctives",
+    "rows",
+)
+
+
 def _options_table(targets: Sequence[lifecycle.Target]) -> DataTable | None:
     if not targets:
         return None
@@ -1523,12 +1977,25 @@ def _options_table(targets: Sequence[lifecycle.Target]) -> DataTable | None:
     )
 
 
-def _no_target_message(resolution: lifecycle.NotFound, action: str) -> str:
-    if not resolution.available:
+def _model_options_table(models: Sequence[lifecycle.ModelTarget]) -> DataTable | None:
+    if not models:
+        return None
+    return DataTable(
+        columns=["id", "data model", "versions", "sample databases"],
+        rows=[[m.short_id, m.name, str(m.version_count), str(m.database_count)] for m in models],
+        caption="data models in this project",
+    )
+
+
+def _no_target_message(resolution: lifecycle.NotFound, action: str, scope: str) -> str:
+    if resolution.models:
         return (
-            "There are no sample databases in this project, so there is nothing to "
-            f"{_VERB[action]}."
+            f"I couldn't find a data model matching {resolution.named!r}. These are the "
+            "ones you have — say which, by name."
         )
+    if not resolution.available:
+        subject = "data models" if scope in ("model", "both") else "sample databases"
+        return f"There are no {subject} in this project, so there is nothing to {_VERB[action]}."
     if resolution.named:
         return (
             f"I couldn't find a sample database matching {resolution.named!r}. These are "

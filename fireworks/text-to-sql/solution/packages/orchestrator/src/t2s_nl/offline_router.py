@@ -48,6 +48,13 @@ model. What this module refuses to do is guess between ``destroy`` and
 ``clear_data`` when an utterance supports both readings; it asks, exactly as the
 router prompt tells the model to.
 
+*W18 adds model deletion to the same table, and the same honesty applies.*
+``destroy`` now covers the data model as well as the sample database, and which
+one is a ``delete_scope`` on the directive. When only one cue family fires this
+module fills it in; when both do it writes ``"unspecified"`` and lets the
+orchestrator ask, because the two readings differ by an entire database and
+there is no keyword technique that picks between them honestly.
+
 *It has no conversational memory and does not pretend to.* ``RouterContext`` now
 carries recent turns (``t2s_nl.history``) for the model's benefit. This module
 **never reads them** -- there is no keyword technique for "the one I already
@@ -68,6 +75,7 @@ from typing import TYPE_CHECKING, Final
 
 from t2s_nl.intents import (
     MAX_PLAN_DIRECTIVES,
+    DeleteScope,
     Directive,
     InspectTarget,
     Intent,
@@ -293,14 +301,35 @@ NO_HISTORY_QUESTION: Final = (
     "the database's id from /dbs."
 )
 
-#: The instance itself goes. Every pattern pairs a destructive verb with a word
-#: that means "the database", so "delete the rows" never lands here.
+#: The instance itself goes, and the utterance **names** it. Every pattern pairs
+#: a destructive verb with a word that means "the database", so "delete the rows"
+#: never lands here.
 _DESTROY = _compile(
     r"\b(delete|destroy|drop|remove|nuke|obliterate|trash|scrap)\b[^.]{0,40}?"
     r"\b(database|databases|db|dbs|instance)\b",
+)
+
+#: Destructive, and names nothing: "blow it away", "get rid of it", "delete
+#: that". Kept apart from :data:`_DESTROY` since W18, because these say only
+#: *that* something should go and not *what* -- so they must not count as
+#: evidence for "the database" when the same sentence names a model ("get rid
+#: of that data model"). They still default to the database when nothing else
+#: fires, which is W17's behaviour and the session's current pointer.
+_DESTROY_BARE = _compile(
     r"\b(blow (it |that )?away|tear (it |that )?down|get rid of)\b",
     r"\b(delete|destroy|drop|remove) (it|that|this|them)\b",
     r"\btotally delete\b",
+)
+
+#: W18. The same destructive verbs paired with a word that means "the design".
+#: Routing one of these destroys nothing -- it produces a description of the
+#: whole cascade and a question -- so keyword-routing it is exactly as safe as
+#: keyword-routing a database destroy, and leaving it out would mean the newest
+#: and largest deletion is the one that silently stops working with no key.
+_DESTROY_MODEL = _compile(
+    r"\b(delete|destroy|drop|remove|nuke|obliterate|trash|scrap)\b[^.]{0,40}?"
+    r"\b(data ?models?|models?|designs?)\b",
+    r"\b(get rid of|blow away)\b[^.]{0,40}?\b(data ?models?|models?|designs?)\b",
 )
 
 #: The rows go, the instance stays.
@@ -398,7 +427,8 @@ _AMBIGUOUS_QUESTION: Final = (
 #: orchestrator fall back to the session's current database or ask, and both are
 #: better than confidently naming the wrong one.
 _NAMED_OBJECT = re.compile(
-    r"\b(?:the|my|that|this)?\s*([a-z0-9][a-z0-9 '_-]{0,40}?)\s+(?:database|db|instance)\b",
+    r"\b(?:the|my|that|this)?\s*([a-z0-9][a-z0-9 '_-]{0,40}?)"
+    r"\s+(?:database|db|instance|data model|model|design)\b",
     re.IGNORECASE,
 )
 
@@ -562,12 +592,27 @@ def _classify(segment: str, context: RouterContext | None) -> _Match:  # noqa: P
     if cue := _first(_HISTORY_REFERENCE, segment):
         return _Match("unknown", cue, question=_HISTORY_MARKER)
 
-    destroy_cue = _first(_DESTROY, segment)
+    named_database = _first(_DESTROY, segment)
+    destroy_cue = named_database or _first(_DESTROY_BARE, segment)
+    model_cue = _first(_DESTROY_MODEL, segment)
     clear_cue = _first(_CLEAR_DATA, segment)
-    if destroy_cue and clear_cue:
-        return _Match("unknown", f"{destroy_cue} / {clear_cue}", question=_AMBIGUOUS_QUESTION)
-    if destroy_cue:
-        return _Match("destroy", destroy_cue, Parameters(model_ref=_named_object(segment)))
+    if (destroy_cue or model_cue) and clear_cue:
+        return _Match(
+            "unknown", f"{destroy_cue or model_cue} / {clear_cue}", question=_AMBIGUOUS_QUESTION
+        )
+    if destroy_cue or model_cue:
+        # W18. Which of the two the user meant is a *scope*, not a separate
+        # intent, and it is the one thing this module refuses to decide when
+        # both cues fire: "delete the sports model and its database" gets
+        # `unspecified`, which the orchestrator turns into a question that
+        # enumerates both blast radii. That is a better answer than either guess
+        # and it is available offline precisely because asking costs no model.
+        scope = _delete_scope(model_cue, named_database)
+        return _Match(
+            "destroy",
+            model_cue or destroy_cue,
+            Parameters(model_ref=_named_object(segment), delete_scope=scope),
+        )
     if clear_cue:
         return _Match("clear_data", clear_cue, Parameters(model_ref=_named_object(segment)))
 
@@ -596,6 +641,20 @@ def _classify(segment: str, context: RouterContext | None) -> _Match:  # noqa: P
         return _Match("query", "a question with no deterministic answer", Parameters(text=segment))
 
     return _Match("unknown", "")
+
+
+def _delete_scope(model_cue: str, named_database: str) -> DeleteScope:
+    """Which of the two the utterance named, or "unspecified" when it named both.
+
+    ``named_database`` is deliberately narrower than "a destructive cue fired".
+    "Get rid of that data model" carries a bare destructive phrase *and* a model
+    cue, and reading the bare phrase as evidence for "the database" would turn
+    an unambiguous request into a question. Only an utterance that names a
+    database outright can make the scope open.
+    """
+    if model_cue and named_database:
+        return "unspecified"
+    return "model" if model_cue else "database"
 
 
 def _first(patterns: tuple[re.Pattern[str], ...], segment: str) -> str:
@@ -647,9 +706,9 @@ def _table(segment: str, context: RouterContext | None) -> str | None:
 #: also catches "delete".
 _OBJECT_NOISE: Final[frozenset[str]] = frozenset(
     {
-        "blow", "clear", "delete", "destroy", "drop", "empty", "flush", "get", "nuke",
-        "obliterate", "of", "out", "please", "purge", "remove", "rid", "scrap", "totally",
-        "trash", "truncate", "wipe",
+        "blow", "clear", "delete", "design", "destroy", "drop", "empty", "flush", "get",
+        "nuke", "obliterate", "of", "out", "please", "purge", "remove", "rid", "scrap",
+        "totally", "trash", "truncate", "wipe",
     }
 ) | _TABLE_STOPWORDS  # fmt: skip
 

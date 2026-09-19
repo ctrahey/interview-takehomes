@@ -12,7 +12,9 @@ design work added:
 ``execute``       run the current/named query against a loaded database
 ``corrective``    D13: a durable domain fact ("actually, revenue is in cents")
 ``clear_data``    W17: empty a sample database's rows, keeping the instance
-``destroy``       W17: delete a sample database instance entirely
+``destroy``       W17/W18: delete a sample database instance, or (W18) the whole
+                  data model and everything derived from it -- ``delete_scope`` says
+                  which
 ``cancel``        W17: "no, don't" -- never on the wire, see below
 ``unknown``       the router could not tell -- ask, never guess
 ================= ===============================================================
@@ -25,6 +27,14 @@ command, and because they are the first irreversible things layer 3 can do,
 neither ever runs on the utterance that asked for it: the orchestrator
 describes exactly what would be lost and requires an affirmative next turn
 (``t2s_nl.confirmation``).
+
+**W18: ``destroy`` grew a scope rather than a sibling.** The workbench could
+delete a sample database and still not delete the *model* -- the thing users
+name. It is one intent with :data:`DeleteScope` rather than two destructive
+intents, because a third destructive label next to ``destroy`` and
+``clear_data`` is a third way to conflate them, while a scope makes
+model-versus-database one question with one answer. That answer may be
+``"both"``, which is executable precisely because model deletion cascades.
 
 ``cancel`` is in :data:`INTENTS` and deliberately **not** in
 :data:`WIRE_INTENTS`, so it is absent from the JSON schema the model fills in.
@@ -76,6 +86,7 @@ __all__ = [
     "PLAN_SCHEMA_NAME",
     "REFERENT_KINDS",
     "Confidence",
+    "DeleteScope",
     "Directive",
     "Intent",
     "InspectTarget",
@@ -127,6 +138,22 @@ InspectTarget = Literal[
 #: ``query.generate`` activity. No second model call, and nothing invented.
 Referent = Literal["none", "last_query", "last_result", "last_schema", "last_data"]
 
+#: What a ``destroy`` directive is aimed at (W18).
+#:
+#: One intent with a scope rather than two destructive intents, deliberately.
+#: ``destroy`` and ``clear_data`` already sit next to each other in the enum and
+#: W17 documented at length how easily a model conflates neighbouring
+#: destructive labels; adding a third would make that worse, not better. A scope
+#: instead makes "which did you mean?" *one* question with *one* answer -- and
+#: ``"both"`` is then a value the enum can hold rather than a reply the system
+#: has to refuse, which is exactly where Chris's session dead-ended.
+#:
+#: ``"unspecified"`` is not a failure. It is the honest answer whenever the
+#: user named an object without saying whether they meant the design or the
+#: instance built from it, and the orchestrator turns it into a question that
+#: enumerates both blast radii.
+DeleteScope = Literal["model", "database", "both", "unspecified"]
+
 Confidence = Literal["high", "medium", "low"]
 
 #: Who cut the utterance into directives. ``"model"`` is the router's LLM call;
@@ -148,6 +175,7 @@ DESTRUCTIVE_INTENTS: frozenset[str] = frozenset({"destroy", "clear_data"})
 WIRE_INTENTS: tuple[str, ...] = tuple(i for i in INTENTS if i != "cancel")
 _TARGETS: tuple[str, ...] = get_args(InspectTarget)
 _REFERENTS: tuple[str, ...] = get_args(Referent)
+_DELETE_SCOPES: tuple[str, ...] = get_args(DeleteScope)
 
 PLAN_SCHEMA_NAME = "t2s_plan"
 
@@ -186,6 +214,14 @@ class Parameters(BaseModel):
             "A saved object the user named, by name or UUID -- a data model, or "
             "the sample database they identified by its model's name. This is how "
             "destroy/clear_data say *which* instance."
+        ),
+    )
+    delete_scope: DeleteScope = Field(
+        default="unspecified",
+        description=(
+            "Only meaningful when intent is 'destroy': whether the user meant the "
+            "data model, the sample database built from it, or both. 'unspecified' "
+            "when they did not say -- the orchestrator asks."
         ),
     )
     row_count: int | None = Field(
@@ -310,9 +346,35 @@ def _param_schema() -> dict[str, Any]:
                 "type": ["string", "null"],
                 "description": (
                     "The saved object the user named, in their own words -- 'the sports "
-                    "league database', 'bookstore'. Required for destroy and clear_data "
-                    "whenever the user named one; null when they said only 'it' or 'this "
-                    "one', which the orchestrator resolves from the conversation."
+                    "league database', 'the sports league model', 'bookstore'. Required "
+                    "for destroy and clear_data whenever the user named one; null when "
+                    "they said only 'it' or 'this one', which the orchestrator resolves "
+                    "from the conversation. Copy their words including any 'model' or "
+                    "'database' in them; a separate deterministic component matches the "
+                    "name and 'parameters.delete_scope' carries which of the two they "
+                    "meant."
+                ),
+            },
+            "delete_scope": {
+                "type": "string",
+                "enum": list(_DELETE_SCOPES),
+                "description": (
+                    "Only for intent 'destroy'. What the user wants deleted. "
+                    "'database' = the sample DATABASE INSTANCE built from a model: the "
+                    "file and its rows go, the design survives and another database can "
+                    "be built from it. Use when they say 'database', 'db', 'instance', "
+                    "or name one by its id. "
+                    "'model' = the DATA MODEL itself -- the design. Deleting it also "
+                    "deletes every version, schema, dataset and sample database derived "
+                    "from it, so it is strictly the larger of the two. Use when they say "
+                    "'model', 'data model', 'design', or 'the whole thing'. "
+                    "'both' = they explicitly asked for the model AND its database, or "
+                    "answered a question with 'both', 'everything', 'all of it'. "
+                    "'unspecified' = they named an object but not which of the two they "
+                    "meant ('delete the sports league one', 'get rid of sports league'). "
+                    "Do NOT guess: 'unspecified' makes the system ask, and asking costs a "
+                    "turn while guessing costs their data. Use 'unspecified' for every "
+                    "intent other than 'destroy'."
                 ),
             },
             "row_count": {"type": ["integer", "null"]},
@@ -326,7 +388,15 @@ def _param_schema() -> dict[str, Any]:
                 ),
             },
         },
-        "required": ["inspect_target", "table", "model_ref", "row_count", "seed", "text"],
+        "required": [
+            "inspect_target",
+            "table",
+            "model_ref",
+            "delete_scope",
+            "row_count",
+            "seed",
+            "text",
+        ],
         "additionalProperties": False,
     }
 
@@ -359,13 +429,20 @@ def _directive_schema() -> dict[str, Any]:
                     "and it can be reloaded. Use for 'empty it', 'wipe the data', "
                     "'truncate the tables', 'clear out the rows', 'start again with "
                     "no data'. "
-                    "'destroy' = DELETE THE SAMPLE DATABASE INSTANCE ITSELF: the "
-                    "file and its tables are gone and the id stops resolving. Use "
-                    "for 'delete the database', 'drop it', 'destroy the instance', "
-                    "'get rid of it entirely', 'blow it away'. "
-                    "If the user's words fit both readings and nothing settles it, "
-                    "choose 'unknown' and ask which they mean -- do not guess "
-                    "between them, because one of the two cannot be undone. "
+                    "'destroy' = DELETE SOMETHING FOR GOOD -- either the sample "
+                    "DATABASE INSTANCE (the file and its rows go; the design "
+                    "survives and another database can be built from it) or the "
+                    "DATA MODEL itself (the design, and with it every version, "
+                    "schema, dataset and sample database derived from it). Which "
+                    "of the two goes in 'parameters.delete_scope'; the intent is "
+                    "the same either way. Use for 'delete the bookstore database', "
+                    "'delete the sports model', 'drop it', 'get rid of it "
+                    "entirely', 'blow it away'. "
+                    "If the user's words fit both 'clear_data' and 'destroy' and "
+                    "nothing settles it, choose 'unknown' and ask which they mean "
+                    "-- do not guess, because one of the two cannot be undone. "
+                    "(Model-versus-database is NOT that case: it is a scope, so "
+                    "stay on 'destroy' and set delete_scope to 'unspecified'.) "
                     "'unknown' = you cannot tell; ask instead of guessing."
                 ),
             },

@@ -27,10 +27,12 @@ from t2s_nl.router import RouterContext
 __all__ = [
     "CONTEXTS",
     "EMPTY_CONTEXT",
+    "LIFECYCLE_SCRIPT",
     "LOADED_CONTEXT",
     "MONEY_PATH",
     "RECALL_CONTEXT",
     "ROUTER_CASES",
+    "ROUTER_SCOPE_CASES",
     "SECURITY_SCRIPTS",
 ]
 
@@ -88,6 +90,15 @@ CONTEXTS: dict[str, RouterContext] = {
 #: disagrees, so a regression in the router prompt is visible at capture time
 #: and not only in CI.
 ROUTER_CASES: list[tuple[str, str, tuple[str, ...]]] = [
+    # -- W18. Deleting a data model, and the scope question that made Chris's
+    # session dead-end. All four stay on `destroy`: model-versus-database is a
+    # scope, not a second verb, and the expectation here is the intent -- the
+    # scope itself is asserted separately in `test_router_intents`, because a
+    # case tuple of intents cannot express it.
+    ("can you delete the sports model?", "loaded", ("destroy",)),
+    ("remove the sports league data model", "loaded", ("destroy",)),
+    ("delete the bookstore data model and its sample database", "loaded", ("destroy",)),
+    ("get rid of that whole design, versions and all", "loaded", ("destroy",)),
     # -- W17 lifecycle. The pair below is the exact ambiguity that produced the
     # bad session: "clear out ... just totally delete it" reads both ways, and
     # the enum descriptions exist to separate them.
@@ -197,6 +208,22 @@ ROUTER_CASES: list[tuple[str, str, tuple[str, ...]]] = [
     ("I already mentioned it - do you not have that context?", "recall", ("unknown",)),
 ]
 
+#: (utterance, context name, expected `delete_scope` on the first directive).
+#: W18. Kept apart from `ROUTER_CASES` because a case there asserts a tuple of
+#: intents and the scope is a *parameter*, not an intent -- and because the
+#: scope is the whole thing W18 added, so it deserves an assertion of its own
+#: rather than riding along inside one about something else. The utterances are
+#: a subset of `ROUTER_CASES`, so no extra fixture is captured for them.
+ROUTER_SCOPE_CASES: list[tuple[str, str, str]] = [
+    ("can you delete the sports model?", "loaded", "model"),
+    ("remove the sports league data model", "loaded", "model"),
+    ("get rid of that whole design, versions and all", "loaded", "model"),
+    ("delete the bookstore data model and its sample database", "loaded", "both"),
+    ("delete the sports league database", "loaded", "database"),
+    ("delete the sports league database entirely", "loaded", "database"),
+    ("get rid of that database for good", "loaded", "database"),
+]
+
 #: The end-to-end path from MAIN.md: describe → DDL → database → data →
 #: question → SQL → execute, plus a corrective in the middle that must change
 #: the SQL that comes out the far side.
@@ -209,6 +236,23 @@ MONEY_PATH: list[str] = [
     "run that",
     "actually, price_cents is in cents, so any revenue figure must be divided by 100",
     "show me my databases",
+]
+
+#: W18: Chris's session, verbatim, as a whole conversation. Captured because
+#: the three utterances are the specification -- the last of them used to be met
+#: with "I don't have a way to delete data models", and the middle one ("both")
+#: used to be met with "what two things?". Kept out of `SECURITY_SCRIPTS`
+#: deliberately: those exist to prove an injection does nothing, and the
+#: injection tests iterate that dict.
+#:
+#: Nothing is destroyed by replaying it. Every destructive turn stops at a
+#: description, because the script never says yes -- which is itself the
+#: property worth replaying.
+LIFECYCLE_SCRIPT: list[str] = [
+    "model a sports league with teams, matches and results",
+    "can you delete the sports model?",
+    "both",
+    "remove the sports league data model",
 ]
 
 #: Injection attempts delivered through the two channels layer 3 opens: an

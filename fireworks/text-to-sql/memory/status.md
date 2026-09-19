@@ -52,6 +52,7 @@ local-sandbox-only and must not be baked into CI.
 | W16 offline router + keyless chat | **done** — `make check` green, 653 tests | opus |
 | W15 conversational HTTP surface | **done** — chat + activity log + SSE, `make check` green, 572 tests |
 | W17 lifecycle intents + conversational history | **done** — `make check` green, 736 tests | opus |
+| W18 model deletion + delete scope | **done** — `make check` green, 830 tests | opus |
 
 ## W14 — containerization (2026-09-18)
 `Dockerfile` (multi-stage, uv-based, python:3.12-slim-bookworm, non-root, 354MB final image),
@@ -377,3 +378,109 @@ cues for the new intent. A **second, conflicting `_pending_plan`** was also writ
 `orchestrator.py`, shadowing this unit's by definition order and referencing fields that do not
 exist (`Parameters.database_id`, `Parameters.confirmed`, `routed_by="confirmation"`); it was
 removed, and a copy is in the session scratchpad.
+
+
+## W18 — the workbench can delete a data model, and knows which you meant (2026-09-19)
+
+From a real session. Chris asked "can you delete the sports model?"; the router asked a good
+disambiguating question ("the data model, the sample database, or something else?"); he answered
+"both"; the reply was "what two things would you like me to do or show?"; he restated "remove the
+sports league data model" and got "I don't have a way to delete data models." **That last answer
+was true.** W17's `destroy` resolved only to sample databases, and `foundation` had no delete for a
+`DataModel` at all. The router could ask the question and then honour neither answer.
+
+**The cascade decision: cascade, and enumerate.** `foundation.deletion` is new and its docstring
+argues the three options. Detaching and keeping the children leaves a sample database whose schema,
+version and model are gone — unreachable through every listing in the system, because all of them
+start from the project's data models, with its file on disk forever. An object the user cannot see
+is an object they cannot delete. So deleting a model takes its versions, their schemas and
+datasets, those schemas' databases, **and those databases' files** (`sample_db.destroy`), plus the
+correctives scoped to it and the `session_data_models` rows.
+
+Two things deliberately survive, and both are stated in the confirmation rather than discovered
+later. **`Query` rows keep their SQL** with `schema_id`/`database_id` nulled: a query's mandatory
+owner is its `Session`, and rewriting the user's conversation is not part of deleting a design.
+**`Activity` rows are untouched** — D14 makes the log append-only, and the record that a model was
+deleted is the one record that must outlive it. Neither is a dangling FK: both pointers are
+nullable by declaration, and an activity references only its session. Everything else that points
+into the subtree from outside — `SessionState` pointers in **every** session, not just this one,
+and `PendingAction` rows in every session — is cleared before the delete, so there is no window in
+which a row names something gone.
+
+The completeness test is reflective rather than a hand-written list: it walks every foreign key in
+`Base.metadata` and asserts nothing still names a deleted row, because the failure mode a cascade
+has is *the table nobody thought of*.
+
+**A quieter payoff, and the reason the cascade is the right call for this session specifically:
+"both" becomes executable.** Deleting the model already deletes its databases, so "both" resolves
+to the model. The question the system was already asking well now has three answers and all three
+run.
+
+**Model-vs-database is a scope, not a second intent.** `Parameters.delete_scope`
+(`model` | `database` | `both` | `unspecified`) on the existing `destroy`. A third destructive enum
+value next to `destroy` and `clear_data` would be a third way to conflate them — exactly the
+failure W17 documented at length — while a scope makes "which did you mean?" one question with one
+answer, and lets that answer be "both". `unspecified` is not a failure mode: it is the honest
+classification when the user named an object without saying which kind, and `t2s_nl.lifecycle`
+turns it into `NeedsScope`, a question that enumerates both blast radii. A pronoun with no scope
+("delete that database") still means the session's current database, exactly as in W17.
+
+**Three turns, and the middle one is not consent.** The scope question is a `PendingAction` with
+`action="destroy_scope"` — same table, deliberately not a permission. `_PENDING_ACTIONS` names
+which pending actions each destructive intent may consume and `destroy_scope` is in none of them,
+so no handler can act on it. Answering it (read by `confirmation.read_scope`, in code, never
+classified) clears it and produces a *description plus a fresh confirmation*. A scope decides how
+large the thing being described is; only a "yes" acts.
+
+**"Both" also widens a standing confirmation**, and that is where the sharpest bug was. A user
+shown a database deletion who says "both" is escalating, not moving on — but the widened `destroy`
+directive would find a live destructive pending row of its own kind, which under W17's gate *is*
+consent. The standing permission is therefore consumed first, logged as `outcome: "widened"`, and
+the next thing that happens is the larger description. A test pins it. "Both" is also the one word
+that cannot be a fresh instruction — it names nothing and commands nothing — which is why it is
+safe to read as an answer at all.
+
+**The blast radius is enumerated, not summarised.** One paragraph plus a table: the model, how many
+versions, each schema by id/version/dialect, **each sample database by id and its current row
+count read from the file**, each dataset by name, the corrective count, the row total, "this cannot
+be undone", and what survives. The counts also go onto the pending row as a `shape` dict, so when
+the user says yes the outcome is compared field-by-field against what they were shown and a
+mismatch is reported rather than glossed over — a confirmation is a promise about size.
+
+**Activity kinds (D14):** `confirm.scope` (the question) and `model.destroy` (the act), alongside
+W17's `confirm.request` / `confirm.resolve`. `model.destroy` is a separate kind from `db.destroy`
+rather than a flag on it, because `/log` has to make the two visibly different sizes of event.
+
+**Offline router.** `destroy` now fills in `delete_scope` by keyword. `_DESTROY` was split: the
+patterns that *name* a database stayed, and the bare ones ("get rid of", "delete that") moved to
+`_DESTROY_BARE`, because otherwise "get rid of that data model" carried a "database" cue and became
+an unnecessary question. Only an utterance that names both leaves the scope open. `read_scope`
+checks "keep the model" **before** "the model" — every phrasing of the smaller answer contains the
+cue for the larger, and that ordering is the difference between deleting and keeping the thing the
+sentence asked to keep.
+
+**Router accuracy: 42/42 on the intent table and 7/7 on the new scope table**, live, with
+`reasoning_effort="none"` (D16 holds). `router.system` v3 → v4; `ROUTER_SCOPE_CASES` is a separate
+table in `scenarios.py` because a case tuple of intents cannot express a parameter, and the scope
+is the whole of what W18 added to the router. The capture script reports scope DIFFs the same way
+it reports intent DIFFs.
+
+**Fixtures re-captured** (the plan schema changed, and `response_schema` is part of the key, so
+every router fixture orphaned). 153 written; 136 orphans traced by instrumenting
+`RecordedClient._load` over the full suite **and** a capture run, then deleted; **156 remain, 0
+orphans**, and a re-run reports `wrote 0 new fixture(s), replayed 163 existing`. A new
+`lifecycle-model-deletion` scenario replays Chris's three utterances end to end and destroys
+nothing, because the script never says yes.
+
+**Found by driving it live:** the cancellation note read "delete the data model the data model
+'sports-league'" (the verb and the subject both named the kind), and the scope table's cells were
+cut off at `render.MAX_CELL` mid-argument — the detail moved into the sentence, which is not
+truncated, and the table became a menu.
+
+**Rough edge.** Restating the *same* deletion while a confirmation for it is pending prints "you
+asked for something else instead, so I've dropped that request and nothing was deleted" and then
+re-describes it. Honest, and mildly odd to read. The fix would be to compare subjects inside the
+invalidation path, which is exactly the safety rule W17 built to be unconditional; left alone
+deliberately.
+
+`make check UV=$HOME/.local/bin/uv` green, **830 tests** (94 new), 3 import contracts kept.

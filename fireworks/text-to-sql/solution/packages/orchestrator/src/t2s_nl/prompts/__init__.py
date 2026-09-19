@@ -17,7 +17,7 @@ __all__ = ["PINS", "REGISTRY", "TEMPLATE_DIR"]
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 
 PINS: dict[str, str] = {
-    "router.system": "v3",
+    "router.system": "v4",
     "router.user": "v2",
     "router.state": "v1",
     "router.history": "v1",

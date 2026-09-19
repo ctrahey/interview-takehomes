@@ -102,26 +102,39 @@ def _drive(store: Store, listener: object | None = None) -> Orchestrator:
 
 
 def _drive_lifecycle(store: Store) -> Orchestrator:
-    """`_drive`, then W17's destructive lifecycle: clear, then destroy.
+    """`_drive`, then the whole destructive lifecycle: clear, destroy, delete the model.
 
     Its own helper rather than more turns on `_drive`, because `_drive` is
     shared and its contract is "ends with a loaded sample database" -- a
     destruction at the end of it would quietly break every caller that relies on
     that, starting with the export test.
 
-    The scripted client is rebuilt with only the two lifecycle classifications
-    in its router queue, and *no* payload for the confirmations: "yes" is read
-    by `t2s_nl.confirmation` and never reaches a model, which is the property
-    being exercised as much as the logging is.
+    The scripted client is rebuilt with only the lifecycle classifications in
+    its router queue, and *no* payload for the confirmations or for the scope
+    answer: "yes", "no" and "just the database" are all read by
+    `t2s_nl.confirmation` and never reach a model, which is the property being
+    exercised as much as the logging is.
+
+    The middle pair is W18's scope question: an utterance that names a model
+    without saying whether the design or its database is meant produces
+    `confirm.scope`, and the answer produces an ordinary confirmation rather
+    than a deletion.
     """
     orch = _drive(store)
     orch.client = ScriptedClient(  # type: ignore[assignment]
-        router=[router_payload("clear_data"), router_payload("destroy")]
+        router=[
+            router_payload("clear_data"),
+            router_payload("destroy", model_ref="bookstore"),
+            router_payload("destroy", model_ref="bookstore", delete_scope="model"),
+        ]
     )
     orch.run("empty that database")
     orch.run("yes")
-    orch.run("delete that database")
-    orch.run("yes")
+    orch.run("delete the bookstore")  # scope unspecified -> confirm.scope
+    orch.run("just the database")  # -> confirm.request for the database
+    orch.run("yes")  # -> db.destroy
+    orch.run("delete the bookstore model")  # -> confirm.request for the model
+    orch.run("yes")  # -> model.destroy
     return orch
 
 
@@ -142,9 +155,9 @@ def _rows(store: Store) -> list[tuple[str, str, str]]:
 def test_every_kind_d14_names_is_actually_emitted(store: Store, sample_db_dir: Path) -> None:
     """Every kind in the taxonomy comes out of a real path.
 
-    D14 named eight; W17 added four for the destructive lifecycle. Two are
-    excluded here and have their own tests: ``query.repair`` needs a rejected
-    candidate, and ``database.export`` is not on this path at all.
+    D14 named eight; W17 added four for the destructive lifecycle and W18 two
+    more. Two are excluded here and have their own tests: ``query.repair`` needs
+    a rejected candidate, and ``database.export`` is not on this path at all.
     """
     _drive_lifecycle(store)
     emitted = {kind for kind, _, _ in _rows(store)}
@@ -166,17 +179,36 @@ def test_a_destruction_logs_the_request_and_the_outcome_separately(
     rows = [
         r
         for r in _log_records(store)
-        if r.kind in {"confirm.request", "confirm.resolve", "db.clear", "db.destroy"}
+        if r.kind
+        in {
+            "confirm.request",
+            "confirm.scope",
+            "confirm.resolve",
+            "db.clear",
+            "db.destroy",
+            "model.destroy",
+        }
         and r.phase == "end"
     ]
     kinds = [r.kind for r in rows]
     assert kinds == [
+        # clear: asked, agreed, done
         "confirm.request",
         "confirm.resolve",
         "db.clear",
+        # W18: the scope question and the answer to it. The answer is its own
+        # resolution and NOT a permission -- nothing is deleted between these
+        # two rows and the confirm.request that follows them.
+        "confirm.scope",
+        "confirm.resolve",
+        # destroy the database: asked, agreed, done
         "confirm.request",
         "confirm.resolve",
         "db.destroy",
+        # destroy the model: asked, agreed, done
+        "confirm.request",
+        "confirm.resolve",
+        "model.destroy",
     ], kinds
     requested = rows[0]
     assert requested.detail is not None
