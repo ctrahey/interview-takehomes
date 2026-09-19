@@ -17,6 +17,7 @@ from typing import Annotated
 from fastapi import Depends, Request
 from sqlalchemy.orm import Session as OrmSession
 
+from t2s_api.problems import ApiProblem
 from t2s_core.clients import FireworksClient
 from t2s_core.config import FireworksConfig
 from t2s_core.ports import InferenceClient, QueryValidator, SchemaValidator
@@ -58,7 +59,24 @@ def get_inference_client(request: Request) -> InferenceClient:
     """
     client: InferenceClient | None = request.app.state.inference_client
     if client is None:
-        client = FireworksClient(FireworksConfig.from_env())
+        try:
+            client = FireworksClient(FireworksConfig.from_env())
+        except RuntimeError as exc:
+            # A missing credential is a deployment condition, not a bug, and it
+            # must not read as "something broke inside the server". 503 with a
+            # concrete remedy: the operator sets a variable, the caller retries.
+            # Layer-1 CRUD keeps working throughout -- that is the whole reason
+            # this client is built lazily rather than at startup.
+            raise ApiProblem(
+                status_code=503,
+                type_slug="inference-unavailable",
+                title="Inference Unavailable",
+                detail=(
+                    "This endpoint needs a language model, and no Fireworks "
+                    "credential is configured. Set FIREWORKS_API_KEY on the "
+                    "server. Endpoints that do not call a model are unaffected."
+                ),
+            ) from exc
         request.app.state.inference_client = client
     return client
 

@@ -26,10 +26,10 @@ Three shapes carry the whole contract and are worth naming:
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from t2s_core.models import Attempt
 from t2s_nl.activity import ActivityRecord
@@ -144,6 +144,21 @@ class ActivityOut(BaseModel):
     request_id: str | None = Field(
         default=None, description="The provider's opaque request handle. Never a credential."
     )
+
+    @field_validator("at")
+    @classmethod
+    def _always_utc(cls, value: datetime) -> datetime:
+        """Tag a naive timestamp as UTC, because that is what it is.
+
+        `foundation` writes `datetime.now(UTC)`, but SQLite has no timezone
+        type and hands the value back naive. A row therefore serialised as
+        `...121016` when replayed from the database and `...121016Z` when
+        published live from the in-memory record -- the same instant, in two
+        formats, one of which a browser parses as local time. Normalising here
+        is what makes "the stream and the page agree" true rather than nearly
+        true.
+        """
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
     @classmethod
     def from_record(cls, record: ActivityRecord) -> ActivityOut:

@@ -11,8 +11,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import pytest
 from fastapi.testclient import TestClient
 
+from t2s_api.app import create_app
 from t2s_core.errors import (
     FixtureNotFound,
     InvalidResponse,
@@ -135,3 +137,33 @@ def test_api_key_never_appears_anywhere_in_a_response(
     response = client.post("/text-to-sql/query", json=_VALID_PAYLOAD)
     assert "fw-fake-would-be-secret-1234567890" not in response.text
     assert "Authorization" not in response.text
+
+
+def test_a_missing_credential_is_503_not_500(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No key is a deployment condition, not a server fault.
+
+    It surfaced as a generic 500 "unexpected internal error", which tells an
+    operator nothing and reads like a crash. Layer-1 CRUD keeps working.
+    """
+    monkeypatch.delenv("FIREWORKS_API_KEY", raising=False)
+    app = create_app()  # no injected client: the lazy live path
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post(
+        "/text-to-sql/query",
+        json={
+            "question": "how many customers are there?",
+            "schema_ddl": "CREATE TABLE customers (id INTEGER PRIMARY KEY);",
+            "dialect": "sqlite",
+        },
+    )
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["title"] == "Inference Unavailable"
+    assert "FIREWORKS_API_KEY" in body["detail"]
+    assert response.headers["content-type"].startswith("application/problem+json")
+
+    # The deterministic layer is unaffected -- that is why the client is lazy.
+    created = client.post("/projects", json={"name": "still works", "slug": "still-works"})
+    assert created.status_code == 201

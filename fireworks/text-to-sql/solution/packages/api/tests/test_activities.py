@@ -136,3 +136,27 @@ def test_an_over_large_limit_is_rejected_rather_than_served(
     client, session_id = _busy_session(chat_doubles, make_client, make_session)
     response = client.get(f"/sessions/{session_id}/activities", params={"limit": 10_000})
     assert response.status_code == 422
+
+
+def test_every_timestamp_is_utc_marked_however_the_row_was_read(
+    chat_doubles: SimpleNamespace,
+    make_client: Callable[[InferenceClient], TestClient],
+    make_session: Callable[[TestClient], str],
+) -> None:
+    """The same row must not read as UTC live and as local time on replay.
+
+    `foundation` writes `datetime.now(UTC)`; SQLite has no timezone type and
+    returns it naive. Without normalisation, a row published live carried a
+    `Z` and the same row replayed out of the database did not -- and a browser
+    parses a bare timestamp as local time. Found by driving the live server.
+    """
+    client, session_id = _busy_session(chat_doubles, make_client, make_session)
+
+    page = client.get(f"/sessions/{session_id}/activities").json()["activities"]
+    live = client.post(f"/sessions/{session_id}/chat", json={"utterance": "model a shop"}).json()[
+        "activities"
+    ]
+
+    assert page and live
+    for row in [*page, *live]:
+        assert row["at"].endswith("Z"), row["at"]
