@@ -50,6 +50,11 @@ services:
       # unset -- so plain `docker compose up` needs no Postgres at all.
       T2S_API_DB_URL: ${T2S_API_DB_URL:-sqlite:////data/foundation/foundation.sqlite3}
       T2S_SAMPLE_DB_DIR: /data/sample_dbs
+      # Where `export` / "save a copy locally" writes. The container runs as a
+      # non-root user and its working directory (/app) is not writable, so the
+      # default of cwd fails inside a container. This points at a bind mount, so
+      # the copy lands on the HOST -- which is the entire point of exporting it.
+      T2S_EXPORT_DIR: /data/exports
       # Container-to-host CORS: a host-run Vite/webpack dev server (default
       # 5173/3000) is already allowed (t2s_api.app.DEFAULT_CORS_ORIGINS).
       # Override here for any other origin.
@@ -71,6 +76,9 @@ services:
       # real files a user can spend real time creating/loading -- losing
       # them on `docker compose down`/restart would be a bad surprise.
       - sample_dbs:/data/sample_dbs
+      # Bind, not a named volume: an export you cannot open from the host is
+      # not an export. Override the host side with T2S_EXPORT_HOST_DIR.
+      - ${T2S_EXPORT_HOST_DIR:-./exports}:/data/exports
       # Named volume: foundation's own metadata store (projects, sessions,
       # data models, activities, ...) when running the SQLite default. Inert
       # once T2S_API_DB_URL points at Postgres instead.
@@ -114,6 +122,11 @@ services:
     environment:
       T2S_DB_URL: ${T2S_DB_URL:-sqlite:////data/foundation/foundation.sqlite3}
       T2S_SAMPLE_DB_DIR: /data/sample_dbs
+      # Where `export` / "save a copy locally" writes. The container runs as a
+      # non-root user and its working directory (/app) is not writable, so the
+      # default of cwd fails inside a container. This points at a bind mount, so
+      # the copy lands on the HOST -- which is the entire point of exporting it.
+      T2S_EXPORT_DIR: /data/exports
       # Forwarded from your shell when set, so `FIREWORKS_API_KEY=$(cat
       # ~/.fireworks-key) docker compose run chat` just works. Compose only
       # passes variables it is told about; the host's ~/.fireworks-key is NOT
@@ -129,6 +142,9 @@ services:
       # which read_api_key() treats as "no key" rather than crashing.
       - ${T2S_KEY_FILE:-${HOME}/.fireworks-key}:/home/t2s/.fireworks-key:ro
       - sample_dbs:/data/sample_dbs
+      # Bind, not a named volume: an export you cannot open from the host is
+      # not an export. Override the host side with T2S_EXPORT_HOST_DIR.
+      - ${T2S_EXPORT_HOST_DIR:-./exports}:/data/exports
       - foundation_meta:/data/foundation
     stdin_open: true
     tty: true
