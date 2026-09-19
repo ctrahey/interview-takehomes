@@ -916,6 +916,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "foundation" },
     { name = "t2s-core" },
+    { name = "t2s-nl" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -924,6 +925,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "foundation", editable = "packages/foundation" },
     { name = "t2s-core", editable = "packages/t2s_core" },
+    { name = "t2s-nl", editable = "packages/orchestrator" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
 ]
 

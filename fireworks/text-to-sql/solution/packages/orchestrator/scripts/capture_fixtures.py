@@ -39,8 +39,9 @@ from t2s_core.errors import FixtureNotFound
 from t2s_core.ports import InferenceResponse, Message
 from t2s_nl.clients import NL_FIXTURE_DIR, read_api_key
 from t2s_nl.orchestrator import Orchestrator
-from t2s_nl.router import RouterContext, route
+from t2s_nl.router import route
 from t2s_nl.scenarios import (
+    EMPTY_CONTEXT,
     LOADED_CONTEXT,
     MONEY_PATH,
     ROUTER_CASES,
@@ -99,22 +100,33 @@ def capture_router(client: CachingRecorder) -> int:
     response makes ``reasoning_effort="none"`` misclassify, it shows up here as
     a number, at capture time, rather than as a mystery in CI.
     """
-    print(f"router: {len(ROUTER_CASES)} utterances")
+    print(f"router: {len(ROUTER_CASES)} utterances x 2 contexts")
     diffs = 0
     for utterance, context_name, expected in ROUTER_CASES:
-        context = LOADED_CONTEXT if context_name == "loaded" else RouterContext()
-        plan = route(utterance, client=client, context=context)
+        # Capture EVERY utterance against BOTH contexts, not just the one the
+        # case declares. The router context is part of the prompt, so an empty
+        # session and a loaded one produce different request keys for the same
+        # words -- and offline mode starts every conversation empty. Capturing
+        # only the declared context is why T2S_OFFLINE=1 died on "show me my
+        # databases" the moment a real user typed it into a fresh session.
+        plans = {
+            "empty": route(utterance, client=client, context=EMPTY_CONTEXT),
+            "loaded": route(utterance, client=client, context=LOADED_CONTEXT),
+        }
+        # The expectation belongs to the declared context only: "run that"
+        # means something different with nothing to run.
+        plan = plans[context_name if context_name in plans else "empty"]
         got = plan.intents
-        flag = "ok " if got == expected else "DIFF"
         diffs += got != expected
-        shown = " → ".join(
+        shown = " -> ".join(
             d.intent
             + (f"/{d.parameters.inspect_target}" if d.intent == "inspect" else "")
             + (f"[{d.referent}]" if d.referent != "none" else "")
             for d in plan.directives
         )
+        flag = "ok " if got == expected else "DIFF"
         print(
-            f"  {flag} {utterance[:52]:<54} -> {shown or '(none)'} (wanted {' → '.join(expected)})"
+            f"  {flag} {utterance[:52]:<54} -> {shown or '(none)'} (wanted {' -> '.join(expected)})"
         )
     print(f"  router: {len(ROUTER_CASES) - diffs}/{len(ROUTER_CASES)} matched")
     return diffs

@@ -8,11 +8,16 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "foundation",
     "t2s_core",
+    # Layer 3 (the conversational endpoints). MAIN.md's layering allows this
+    # direction and only this one: t2s_nl may import both lower layers, and the
+    # import-linter contract forbids t2s_nl -> t2s_api.
+    "t2s_nl",
 ]
 
 [tool.uv.sources]
 foundation = { workspace = true }
 t2s_core = { workspace = true }
+t2s_nl = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

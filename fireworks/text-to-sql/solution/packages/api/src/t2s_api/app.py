@@ -19,9 +19,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import Engine
 
 from foundation.db import init_db, make_session_factory
+from t2s_api.activity_stream import ActivityBroker
 from t2s_api.db import default_engine
 from t2s_api.problems import register_exception_handlers
 from t2s_api.routers import (
+    chat,
     data_models,
     databases,
     datasets,
@@ -40,6 +42,12 @@ __all__ = ["app", "create_app"]
 #: comma-separated ``T2S_CORS_ORIGINS``. Deliberately NOT ``*``: this API can
 #: create and query databases, and a wildcard default is the kind of thing that
 #: survives all the way to a deployment nobody re-read.
+#:
+#: This also covers the SSE stream: an ``EventSource`` is a plain GET, so the
+#: middleware's ``Access-Control-Allow-Origin`` on the streaming response is
+#: the whole of what a cross-origin browser client needs. It is the usual place
+#: SSE breaks, so `tests/test_chat_stream.py` asserts the header is on the
+#: stream and not merely on the JSON routes.
 DEFAULT_CORS_ORIGINS = (
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -88,7 +96,8 @@ def create_app(
         description=(
             "Layer 1: deterministic CRUD over projects, sessions, data models, schemas, "
             "datasets, and sample databases. Layer 2: stateless text-to-SQL generation. "
-            "See memory/design.md §5."
+            "Layer 3: conversational chat per session, its append-only activity log, and "
+            "a live SSE stream of that log. See memory/design.md §5."
         ),
     )
 
@@ -96,7 +105,13 @@ def create_app(
 
     resolved_engine = engine or default_engine()
     init_db(resolved_engine)
+    app.state.engine = resolved_engine
     app.state.session_factory = make_session_factory(resolved_engine)
+    #: One per app: the fan-out from the orchestrator's activity emitter (D14)
+    #: to whatever SSE clients are watching. Lives on the app rather than the
+    #: request because the run that appends a row and the connection that
+    #: displays it are two different requests.
+    app.state.activity_broker = ActivityBroker()
     app.state.inference_client = inference_client
     app.state.query_validator = query_validator
     app.state.schema_validator = schema_validator
@@ -108,6 +123,7 @@ def create_app(
     app.include_router(datasets.router)
     app.include_router(databases.router)
     app.include_router(text_to_sql.router)
+    app.include_router(chat.router)
 
     register_exception_handlers(app)
     return app
