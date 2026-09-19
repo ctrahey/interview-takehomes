@@ -61,6 +61,10 @@ class ArmMetrics:
     accuracy_by_tier: dict[str, Ratio]
     strict_name_accuracy: Ratio
     order_insensitive_accuracy: Ratio
+    #: W12 secondary metric, reported beside execution accuracy and never
+    #: instead of it: the gold's columns are all present in the candidate's
+    #: result with matching values per row, extra columns ignored.
+    column_subset_accuracy: Ratio
     abstention_accuracy: Ratio
     corpus_accuracy: Ratio
     valid_sql_rate: Ratio
@@ -98,6 +102,7 @@ class ArmMetrics:
             "accuracy_by_tier": {k: v.as_dict() for k, v in self.accuracy_by_tier.items()},
             "strict_name_accuracy": self.strict_name_accuracy.as_dict(),
             "order_insensitive_accuracy": self.order_insensitive_accuracy.as_dict(),
+            "column_subset_accuracy": self.column_subset_accuracy.as_dict(),
             "abstention_accuracy": self.abstention_accuracy.as_dict(),
             "corpus_accuracy": self.corpus_accuracy.as_dict(),
             "valid_sql_rate": self.valid_sql_rate.as_dict(),
@@ -187,6 +192,7 @@ def _summarize_arm(result: ArmResult) -> ArmMetrics:
         },
         strict_name_accuracy=_ratio(gold, "correct_strict_names"),
         order_insensitive_accuracy=_ratio(gold, "correct_order_insensitive"),
+        column_subset_accuracy=_ratio(gold, "correct_column_subset"),
         abstention_accuracy=_ratio(adversarial, "correct"),
         corpus_accuracy=_ratio(runs, "correct"),
         valid_sql_rate=Ratio(len(executes), len(emitted)),

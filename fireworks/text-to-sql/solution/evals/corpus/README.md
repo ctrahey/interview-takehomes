@@ -11,6 +11,8 @@ this package never calls the Fireworks API and has no dependency on `t2s_core` o
 evals/corpus/
   README.md            this file
   manifest.json         the machine-readable item list (see format below)
+  REVISIONS.md          every post-run edit to a question, before/after, with justification
+  revisions.json        machine-readable twin of REVISIONS.md, read by the harness and the tests
   test_corpus.py         pytest verification suite — run: uv run pytest evals/corpus/test_corpus.py
   schemas/
     retail/ddl.sql       multi-hop joins, aggregates, date filtering
@@ -114,7 +116,7 @@ For gold (non-adversarial) items, `expected_response_class` is always `"valid"` 
 
 ## Verification (`test_corpus.py`)
 
-`uv run pytest evals/corpus/test_corpus.py -v` — 29 tests, all offline, no network:
+`uv run pytest evals/corpus/test_corpus.py -v` — 36 tests, all offline, no network:
 
 1. **Fixtures load cleanly** — every schema's DDL + seed loads into a fresh in-memory SQLite DB;
    every table lands in the intended row-count band (20-260, with a documented exception for the
@@ -137,9 +139,29 @@ For gold (non-adversarial) items, `expected_response_class` is always `"valid"` 
    `GROUP BY`; every `easy` item must be single-table (no `JOIN`). No gold query is a bare
    `SELECT * FROM table` unless it's also doing one of the above.
 
+7. **The revision record** — `revisions.json` accounts for every gold item exactly once (as
+   revised or as audited-and-unchanged); each revised item's recorded `after` text is literally
+   the question the manifest ships; each carries a justification and asserts no gold SQL changed;
+   and `REVISIONS.md` quotes every before/after verbatim. An audit log that can drift from the
+   artefact it describes is worse than no audit log, so the binding is a test.
+
+## Revisions
+
+The corpus is the measuring instrument, so edits to it after a live run are recorded, not
+absorbed. `REVISIONS.md` carries every change with its before/after and a one-line justification;
+the W12 entry there covers the 38 questions rewritten to state their output shape after the first
+live run showed the metric was dominated by projection disagreement. The rule applied is narrow:
+a question may be made to *state what it already implied*, never to match what a model returned
+and never to remove a difficulty. No gold SQL has ever been changed by a revision.
+
 ## Manual semantic re-read
 
 Execution success (tests 4-6 above) proves a query *runs* and *returns something*; it does not
 prove the query answers the question that was asked. Every one of the 45 gold pairs was re-read
 by hand against its English question after the automated suite went green — see the W2 report for
 the two ambiguities that surfaced and how they were resolved.
+
+The same re-read was repeated for all 38 questions rewritten in the W12 revision: each edited
+question was read against its (unchanged) gold SQL to confirm the stated output shape is exactly
+the projection the gold returns, and that no filter, join, threshold or sort was altered by the
+new wording.

@@ -248,6 +248,7 @@ def run_arms(
                         correct=False,
                         correct_strict_names=False,
                         correct_order_insensitive=False,
+                        correct_column_subset=False,
                         reason="harness_error",
                         detail=run.harness_error,
                         response_class=None,

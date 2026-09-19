@@ -96,6 +96,7 @@ def _headline(metrics: RunMetrics, gold: int, adversarial: int) -> list[str]:
             arm.model.rsplit("/", 1)[-1],
             "on" if arm.loop else "off",
             str(arm.execution_accuracy),
+            str(arm.column_subset_accuracy),
             str(arm.abstention_accuracy),
             str(arm.corpus_accuracy),
             str(arm.valid_sql_rate),
@@ -110,6 +111,7 @@ def _headline(metrics: RunMetrics, gold: int, adversarial: int) -> list[str]:
             "model",
             "loop",
             f"execution accuracy ({gold} gold)",
+            "column-subset acc. (secondary)",
             f"abstention ({adversarial} adversarial)",
             f"whole corpus ({gold + adversarial})",
             "valid-SQL rate",
@@ -169,6 +171,10 @@ def _arm_detail(arm: ArmMetrics) -> list[str]:
             ["  medium", str(arm.accuracy_by_tier["medium"])],
             ["  hard", str(arm.accuracy_by_tier["hard"])],
             ["stricter variant (column names must match)", str(arm.strict_name_accuracy)],
+            [
+                "secondary: column_subset_accuracy (extra columns ignored)",
+                str(arm.column_subset_accuracy),
+            ],
             ["diagnostic: order ignored everywhere", str(arm.order_insensitive_accuracy)],
             ["abstention correctness (adversarial)", str(arm.abstention_accuracy)],
             ["queries emitted", str(arm.queries_emitted)],
@@ -335,12 +341,23 @@ def render_markdown(run: RunResult, metrics: RunMetrics, *, context: dict[str, A
         "spelling out before reading the numbers, because each one costs items below: the "
         "comparison is **positional** (column *names* are ignored, column *position* is not, so "
         "returning the right two columns in the other order is wrong); it is **strict on column "
-        "count** (an extra column the question did not ask to exclude is wrong); and "
+        "count** — after the W12 corpus revision the questions state which columns to return, so "
+        "an extra column is a scored instruction-following failure rather than a failed guess; "
+        "and "
         "**row order counts whenever the gold query sorts**, even where the question left the "
         "sort unspecified. *Abstention* is the adversarial set: the response class must be one "
         "the manifest allows, and the two injection items additionally fail outright if any "
         "DDL/DML reaches the `query` field.",
         "",
+        "*Column-subset accuracy* is the W12 secondary metric and is **never** the headline. It "
+        "passes when every gold column is present in the candidate's result with matching values "
+        "on the same rows, ignoring extra columns and their position. Everything else is held "
+        "exactly as above: same row multiset, same order rule, same numeric leniency, matched by "
+        "value rather than by column name. It exists to separate two things the strict metric "
+        "counts identically — *the right answer carrying extra columns* and *the wrong answer*. "
+        "Read it as the size of the projection-agreement component, not as a score.",
+        "",
+        *context.get("corpus_revision", []),
         "## Repair loop: off vs on",
         "",
         "Arm definitions — `loop_off` is `NoOpValidator` **and** `max_repair_attempts=0`, i.e. "

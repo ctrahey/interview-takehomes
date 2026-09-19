@@ -12,7 +12,7 @@ from typing import Any
 
 from evals.harness.metrics import ArmMetrics, RunMetrics
 
-__all__ = ["build_context"]
+__all__ = ["build_context", "corpus_revision_section"]
 
 #: Below this, a delta is indistinguishable from noise on a 45-item gold set
 #: (one item is 2.2 points).
@@ -20,6 +20,110 @@ NOISE_FLOOR_PP = 2.3
 
 #: D11's cross-model comparison needs at least two model roles.
 MIN_ROLES_FOR_D11 = 2
+
+
+def corpus_revision_section(
+    metrics: RunMetrics,
+    *,
+    baseline: RunMetrics | None,
+    baseline_source: str | None,
+    revisions: dict[str, Any] | None,
+) -> list[str]:
+    """The before/after block: what changed in the *corpus*, and what it moved.
+
+    Rendered high in the report, directly under the headline, because the
+    instrument was edited between the two runs and a reader has to be able to
+    judge that edit before reading anything it produced.
+    """
+    if not revisions and baseline is None:
+        return []
+    lines = ["## The corpus was revised between these two runs", ""]
+
+    if revisions:
+        revised = revisions.get("revised", [])
+        unchanged = revisions.get("reviewed_unchanged", [])
+        lines += [
+            f"**{revisions.get('revision', '?')} ({revisions.get('date', '?')}): "
+            f"{len(revised)} of {len(revised) + len(unchanged)} gold questions were rewritten; "
+            f"{len(unchanged)} were audited and deliberately left alone.** No `gold_sql` value "
+            "was changed — the manifest diff is question text only, which `git diff` will "
+            "confirm and which the identical baseline column below demonstrates.",
+            "",
+            str(revisions.get("reason", "")),
+            "",
+            "Every edited item, before and after, with a one-line justification: "
+            "`evals/corpus/REVISIONS.md` (machine-readable twin: `evals/corpus/revisions.json`; "
+            "`test_corpus.py` asserts the two agree with the manifest and that all "
+            f"{len(revised) + len(unchanged)} gold items are accounted for).",
+            "",
+            "Items revised: " + ", ".join(f"`{record['id']}`" for record in revised) + ".",
+            "",
+            "Items audited and left unchanged: "
+            + ", ".join(f"`{record['id']}`" for record in unchanged)
+            + ".",
+            "",
+        ]
+
+    if baseline is None:
+        return lines
+
+    lines += [
+        "### Before and after, side by side",
+        "",
+        f"*Before* is the previous live run (`{baseline_source}`), **re-scored by today's "
+        "scorer against today's gold SQL**. That re-scoring is what makes the comparison "
+        "legitimate in one direction and limited in another:",
+        "",
+        "- Its strict execution-accuracy figures are identical to the ones printed in that "
+        "older report. They could only differ if a gold query had changed, so this column is "
+        "also a check that none did.",
+        "- Its `column_subset` figures are new: the metric did not exist when that run was "
+        "scored, so it is computed here from the candidate SQL that run actually recorded.",
+        "- The *after* column is a **fresh live run**. Its delta therefore mixes the corpus "
+        "revision with ordinary run-to-run sampling variance (temperature 0.0 does not make "
+        "these models deterministic). Treat the delta as the combined effect, not as a clean "
+        "measurement of the edit. `evals/reports/README.md` quantifies that variance from two "
+        "complete runs of an identical configuration and states the resulting rule for how "
+        "large a delta has to be before it is a finding; apply it to the Δ column below.",
+        "",
+    ]
+    rows = []
+    for arm in metrics.arms:
+        before = baseline.by_name(arm.arm)
+        if before is None:
+            continue
+        delta = arm.execution_accuracy.pct - before.execution_accuracy.pct
+        rows.append(
+            [
+                f"`{arm.arm}`",
+                str(before.execution_accuracy),
+                str(arm.execution_accuracy),
+                f"{delta:+.1f} pp",
+                str(before.column_subset_accuracy),
+                str(arm.column_subset_accuracy),
+                str(before.failure_reasons.get("column_count_mismatch", 0)),
+                str(arm.failure_reasons.get("column_count_mismatch", 0)),
+            ]
+        )
+    lines += _table(
+        [
+            "arm",
+            "exec acc. BEFORE",
+            "exec acc. AFTER",
+            "Δ",
+            "col-subset BEFORE",
+            "col-subset AFTER",
+            "`column_count_mismatch` BEFORE",
+            "AFTER",
+        ],
+        rows,
+    )
+    return lines + [""]
+
+
+def _table(headers: list[str], rows: list[list[str]]) -> list[str]:
+    lines = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(headers)) + "|"]
+    return lines + ["| " + " | ".join(row) + " |" for row in rows]
 
 
 def _delta_commentary(metrics: RunMetrics) -> list[str]:
@@ -70,7 +174,48 @@ def _delta_commentary(metrics: RunMetrics) -> list[str]:
     return lines
 
 
-def _dominant_failures(metrics: RunMetrics) -> list[str]:
+def _projection_block(metrics: RunMetrics) -> list[str]:
+    """W12's secondary metric, stated as a gap rather than as a score."""
+    rows = [
+        f"`{arm.arm}` {arm.execution_accuracy.numerator}→{arm.column_subset_accuracy.numerator}"
+        for arm in metrics.arms
+        if arm.column_subset_accuracy.numerator != arm.execution_accuracy.numerator
+    ]
+    lines = ["### How much of the score hinges on projection agreement", ""]
+    if not rows:
+        return lines + [
+            "`column_subset_accuracy` equals execution accuracy in every arm: **no** item in this "
+            "run produced the gold's rows under a different column list. After the W12 corpus "
+            "revision the two metrics have converged, which is what a corpus whose questions "
+            "state their output shape should look like.",
+            "",
+        ]
+    return lines + [
+        "Scoring column-subset-wise (the W12 secondary metric — every gold column present with "
+        "matching values, extra columns ignored) instead of strictly would change these arms: "
+        + ", ".join(rows)
+        + ". Those are items where the candidate carried the gold's answer inside a wider "
+        "projection. The headline number stays strict execution accuracy; this is the size of "
+        "the projection component, reported beside it and never in place of it.",
+        "",
+    ]
+
+
+def _top_failure(metrics: RunMetrics) -> tuple[str, float] | None:
+    """The most common failure reason across every arm, and its share."""
+    totals: dict[str, int] = {}
+    failures = 0
+    for arm in metrics.arms:
+        for reason, count in arm.failure_reasons.items():
+            totals[reason] = totals.get(reason, 0) + count
+            failures += count
+    if not failures:
+        return None
+    reason, count = max(totals.items(), key=lambda kv: kv[1])
+    return reason, 100.0 * count / failures
+
+
+def _dominant_failures(metrics: RunMetrics, revisions: dict[str, Any] | None) -> list[str]:
     """Name the failure mode that actually drives the headline number."""
     totals: dict[str, int] = {}
     failures = 0
@@ -91,35 +236,57 @@ def _dominant_failures(metrics: RunMetrics) -> list[str]:
         + f" (of {failures} scored failures).",
         "",
     ]
-    if top == "column_count_mismatch":
+    revised = (revisions or {}).get("revised", [])
+    unchanged = (revisions or {}).get("reviewed_unchanged", [])
+    revision_label = (revisions or {}).get("revision", "W12")
+    n_revised, n_gold = len(revised), len(revised) + len(unchanged)
+
+    if top == "column_count_mismatch" and n_revised:
         lines += [
             f"**{share:.0f}% of every failure in this run is `column_count_mismatch`** — the "
             "candidate query returned a different *number of columns* than the gold query. Not "
-            'wrong rows — a different projection. The corpus asks "Which products have been '
-            'discontinued?"; the gold answers with three columns, and the arms that answered it '
-            "returned the same rows under an identical `WHERE` clause with the table's fuller "
-            "column list. That is a correct answer to the question a human asked, and a failure "
-            "of the metric. Check the per-item matrix below: on this corpus the `easy` tier is "
-            "where projection disagreement bites hardest — the opposite of what a "
-            "difficulty-tiered score should look like, and a tell that what varies there is the "
-            "metric rather than the model.",
+            "wrong rows — a different projection. Read that number against "
+            "`column_subset_accuracy` in the headline table before concluding anything about SQL "
+            "competence: where the two diverge, the candidate had the gold's answer and wrapped "
+            "it in extra columns.",
             "",
-            "This is worth stating flatly because it changes how the headline number should be "
-            "read. Execution accuracy here is **not** a measure of SQL competence in isolation; "
-            "on this corpus it is dominated by agreement about which columns to project, which "
-            "the questions do not specify. The comparison rule (strict on column count, lenient "
-            "on column names) is the one fixed in design.md before the run, and it was not "
-            "relaxed afterwards to improve the number. But the honest conclusion is that the "
-            "*corpus* needs the fix, not the scorer: the questions should state the expected "
-            'output shape ("list the name, category and price of..."), which is how a real '
-            "analyst would ask once they had been burned twice. That is the first thing to "
-            "change in a second iteration, and it would move these numbers a long way.",
+            f"The {revision_label} corpus revision rewrote {n_revised} of {n_gold} gold "
+            "questions to state the output shape "
+            "they already implied (`evals/corpus/REVISIONS.md`), so a residual "
+            "`column_count_mismatch` now means the model ignored a stated projection rather than "
+            "failing to guess an unstated one. The comparison rule itself (strict on column "
+            "count, lenient on column names) is the one fixed in design.md before the first run "
+            "and has never been relaxed to improve a number.",
+            "",
+        ]
+    elif top == "order_mismatch":
+        ordering = ", ".join(
+            f"`{arm.arm}` {arm.execution_accuracy.numerator}→"
+            f"{arm.order_insensitive_accuracy.numerator}"
+            for arm in metrics.arms
+            if arm.order_insensitive_accuracy.numerator != arm.execution_accuracy.numerator
+        )
+        lines += [
+            f"**{share:.0f}% of every failure in this run is `order_mismatch`** — the candidate "
+            "returned exactly the gold's rows, in a different order, against a gold query that "
+            "sorts. Order-insensitively the same arms would score " + ordering + ".",
+            "",
+            "This is the *second* instrument defect, and it was left in deliberately. Many golds "
+            "carry a sort the question never asked for (`ORDER BY id` on 'which products have "
+            "been discontinued?'), so the item measures sort telepathy the same way the "
+            "projection items measured column telepathy. It was not fixed in the same change as "
+            f"the {revision_label} question revision, for one reason: with two edits in flight "
+            "the before/after table above would have had two causes and would have proved "
+            "nothing about either. It is named in `evals/corpus/REVISIONS.md` under “scope "
+            "deliberately not taken” and is the first thing to fix next — by stating the sort "
+            "in the questions that imply one and dropping the arbitrary `ORDER BY` from the "
+            "golds that do not, never by loosening D3's order rule after the fact.",
             "",
         ]
     return lines
 
 
-def _caveats(metrics: RunMetrics, extra: list[str]) -> list[str]:
+def _caveats(metrics: RunMetrics, extra: list[str], revisions: dict[str, Any] | None) -> list[str]:
     lines = ["### Accounting", ""]
     total_harness_errors = sum(arm.harness_errors for arm in metrics.arms)
     total_gold_errors = sum(arm.gold_errors for arm in metrics.arms)
@@ -171,7 +338,7 @@ def _caveats(metrics: RunMetrics, extra: list[str]) -> list[str]:
             "the tied rows unspecified — that risk did not materialise here.)",
             "",
         ]
-    return lines + _dominant_failures(metrics) + extra
+    return lines + _projection_block(metrics) + _dominant_failures(metrics, revisions) + extra
 
 
 def _ordered_roles(metrics: RunMetrics) -> list[str]:
@@ -190,14 +357,21 @@ def _interpretation(metrics: RunMetrics) -> list[str]:
     lines: list[str] = []
 
     best = max(metrics.arms, key=lambda a: a.execution_accuracy.pct)
+    top = _top_failure(metrics)
+    dominant = (
+        f"The single largest failure mode is `{top[0]}` ({top[1]:.0f}% of all scored failures) — "
+        'see "What the failures actually are" above before reading the gap as SQL incompetence. '
+        if top
+        else ""
+    )
     lines.append(
         f"1. **Read the headline with its caveat attached.** The best arm is `{best.arm}` at "
         f"{best.execution_accuracy} execution accuracy on the gold pairs and "
         f"{best.abstention_accuracy} on the adversarial set. Accuracy means the candidate was "
         "*executed* against a seeded database and its result set compared to the gold query's. "
-        "As the failure breakdown above shows, most of the gap is projection disagreement, not "
-        'broken SQL — the valid-SQL rate in the same table is the number to look at for "does '
-        'it write SQL that runs", and it is far higher.'
+        + dominant
+        + 'The valid-SQL rate in the same table is the number to look at for "does it write SQL '
+        'that runs", and it is far higher.'
     )
 
     deltas: dict[str, float] = {}
@@ -303,12 +477,15 @@ def build_context(
     cost_note: list[str],
     repro: list[str],
     extra_caveats: list[str],
+    revisions: dict[str, Any] | None = None,
+    corpus_revision: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "gold_items": gold_items,
         "adversarial_items": adversarial_items,
+        "corpus_revision": corpus_revision or [],
         "delta_commentary": _delta_commentary(metrics),
-        "caveats": _caveats(metrics, weak_model_note + extra_caveats),
+        "caveats": _caveats(metrics, weak_model_note + extra_caveats, revisions),
         "cost_note": cost_note,
         "interpretation": _interpretation(metrics),
         "repro": repro,

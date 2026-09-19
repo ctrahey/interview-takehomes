@@ -35,6 +35,7 @@ from t2s_core import FireworksClient, FireworksConfig, InferenceClient
 from t2s_core.config import DEFAULT_MODEL
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
+REVISIONS_PATH = Path(__file__).resolve().parent.parent / "corpus" / "revisions.json"
 
 #: D11's candidate list for the weak arm, in its stated preference order.
 WEAK_CANDIDATES: tuple[str, ...] = (
@@ -90,6 +91,39 @@ class _TruncationCounter(logging.Handler):
             self.truncations += 1
 
 
+#: Written after the W12 audit of all 45 gold items, and repeated in
+#: `evals/corpus/REVISIONS.md`. These are ways the *corpus* is still ill-posed
+#: that W12 deliberately did not fix, because each one changes which rows or
+#: values are correct rather than which columns to return — and fixing more
+#: than one thing at a time would have made the before/after comparison
+#: uninterpretable. Listed here so the report carries them rather than leaving
+#: a reader to infer them from the failure table.
+KNOWN_OPEN_DEFECTS: tuple[str, ...] = (
+    "### Known open defects in the corpus (audited, not fixed)",
+    "",
+    "The W12 audit read all 45 gold items. It fixed exactly one class of ill-posedness — "
+    "questions that did not state their output shape — and found three more that it left alone. "
+    "They are named here because they are now what most of the remaining gap is made of, and "
+    "because a reader should not have to reverse-engineer them from the failure counts:",
+    "",
+    "1. **Row order.** Several golds sort on something the question never asked for (`ORDER BY "
+    "id`). See the order-insensitive diagnostic above for the size of this.",
+    '2. **Row inclusion.** `library-m01` ("how many books in each category") and `library-m04` '
+    "do not say whether a category with zero books should appear; the gold says no, an inner "
+    "join, and a candidate using an outer join returns 13 rows against the gold's 9. `events-m01` "
+    "has the same shape for users with no purchases.",
+    "3. **Rounding and units.** `retail-h05`, `library-h05`, `library-m04` and `events-m05` round "
+    "in the gold (`ROUND(x, 2)`) where the question says nothing about precision, so an unrounded "
+    "candidate is a `value_mismatch` at the sixth decimal place. `events-m01`'s "
+    "cents-versus-dollars question is deliberately left to a domain corrective (D13), not to the "
+    "question text.",
+    "",
+    "Each of these is the same kind of defect as the one W12 fixed, and each would move the "
+    "headline number. They are open, dated and attributable rather than quietly absorbed.",
+    "",
+)
+
+
 def _api_key() -> str:
     key = os.environ.get("FIREWORKS_API_KEY", "")
     if key:
@@ -102,6 +136,55 @@ def _api_key() -> str:
         "FIREWORKS_API_KEY is not set and ~/.fireworks-key does not exist. "
         "The live eval needs one; `make test` runs the offline suite instead."
     )
+
+
+def _revisions() -> dict[str, Any] | None:
+    """The corpus revision record, if the corpus has ever been revised."""
+    if not REVISIONS_PATH.exists():
+        return None
+    data: dict[str, Any] = json.loads(REVISIONS_PATH.read_text(encoding="utf-8"))
+    return data
+
+
+def _rescore(payload: dict[str, Any], corpus: Corpus, built: Any) -> Any:
+    """Score a saved run's recorded candidates with *today's* scorer.
+
+    Used for the baseline column of a before/after report. Scoring never reads
+    the question — only the gold SQL and the candidate — so re-scoring an older
+    run against a corpus whose questions were revised is exactly the right
+    comparison, and its strict accuracy is unchanged unless a gold query moved.
+    """
+    run = rebuild(payload)
+    by_id = {item.id: item for item in corpus.items}
+    for arm in run.arms:
+        for item_run in arm.runs:
+            if item_run.harness_error is not None or item_run.item_id not in by_id:
+                continue
+            item_run.attach(
+                score_item(
+                    by_id[item_run.item_id],
+                    response_class=item_run.response_class,
+                    query=item_run.query,
+                    fixtures=built,
+                    error_code=item_run.error_code,
+                )
+            )
+    return summarize(run)
+
+
+def _latency_note(concurrency: int) -> list[str]:
+    return [
+        "### What the latency numbers do and do not include",
+        "",
+        f"Every arm ran its items with a concurrency of {concurrency}, and the p50/p95 figures "
+        "are wall-clock per item measured client-side. They therefore include **provider-side "
+        "queueing under our own load**, not just model compute: {concurrency} of our requests "
+        "are in flight at once against a shared endpoint. These are not single-request latency "
+        "numbers and must not be quoted as a serving SLO. The comparison between arms is still "
+        "fair — every arm was measured the same way — but the absolute p95 would be lower for "
+        "an unloaded single request.".replace("{concurrency}", str(concurrency)),
+        "",
+    ]
 
 
 def _live_client_factory(key: str) -> Any:
@@ -247,6 +330,7 @@ def cmd_render(args: argparse.Namespace) -> int:
     by_id = {item.id: item for item in corpus.items}
     items = [by_id[item_id] for item_id in run.item_ids]
 
+    baseline = None
     with fixtures(corpus) as built:
         for arm in run.arms:
             for item_run in arm.runs:
@@ -261,9 +345,24 @@ def cmd_render(args: argparse.Namespace) -> int:
                         error_code=item_run.error_code,
                     )
                 )
+        if args.baseline:
+            baseline = _rescore(
+                json.loads(Path(args.baseline).read_text(encoding="utf-8")), corpus, built
+            )
 
     metrics = summarize(run)
     old_context = payload.get("context", {})
+    revisions = _revisions()
+    corpus_revision = (
+        narrative.corpus_revision_section(
+            metrics,
+            baseline=baseline,
+            baseline_source=Path(args.baseline).name,
+            revisions=revisions,
+        )
+        if args.baseline
+        else old_context.get("corpus_revision", [])
+    )
     context = narrative.build_context(
         metrics,
         gold_items=sum(1 for i in items if not i.is_adversarial),
@@ -271,7 +370,9 @@ def cmd_render(args: argparse.Namespace) -> int:
         weak_model_note=_weak_model_note(),
         cost_note=old_context.get("cost_note", []),
         repro=old_context.get("repro", []),
-        extra_caveats=[],
+        extra_caveats=list(KNOWN_OPEN_DEFECTS) + _latency_note(DEFAULT_CONCURRENCY),
+        revisions=revisions,
+        corpus_revision=corpus_revision,
     )
     json_path, md_path = report.write_reports(
         run, metrics, directory=source.parent, context=context
@@ -331,8 +432,14 @@ def cmd_run(args: argparse.Namespace) -> int:
             live=live,
             progress=_echo,
         )
+        metrics = summarize(result)
+        baseline = None
+        if args.baseline:
+            baseline_payload = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
+            baseline = _rescore(baseline_payload, corpus, built)
+            _echo(f"baseline {Path(args.baseline).name}: re-scored with today's scorer")
 
-    metrics = summarize(result)
+    revisions = _revisions()
     context = narrative.build_context(
         metrics,
         gold_items=len(gold),
@@ -340,7 +447,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         weak_model_note=_weak_model_note(),
         cost_note=_cost_note(counter.truncations, metrics),
         repro=_repro(args, models, run_id),
-        extra_caveats=_selection_note(corpus, items),
+        extra_caveats=_selection_note(corpus, items)
+        + list(KNOWN_OPEN_DEFECTS)
+        + _latency_note(args.concurrency),
+        revisions=revisions,
+        corpus_revision=narrative.corpus_revision_section(
+            metrics,
+            baseline=baseline,
+            baseline_source=Path(args.baseline).name if args.baseline else None,
+            revisions=revisions,
+        ),
     )
     json_path, md_path = report.write_reports(
         result, metrics, directory=Path(args.out), context=context
@@ -405,6 +521,15 @@ def _cost_note(truncations: int, metrics: Any) -> list[str]:
         f"Truncation escalations observed (finding #1/#5 — one extra HTTP request each, not "
         f"counted as a model turn above): **{truncations}**.",
         "",
+        "**The token totals above under-count, and by an amount this harness cannot recover.** "
+        "When a completion is truncated at `max_tokens`, `FireworksClient` raises before it "
+        "builds an `InferenceResponse` and retries once at a larger budget; the tokens the "
+        "truncated attempt actually burned are never surfaced to the caller, so they are in the "
+        "bill but not in this table. The floor on the shortfall is "
+        f"{truncations} truncated completion(s) × that attempt's `max_tokens`. Reported rather "
+        "than quietly rounded away; the direction of the error is known (totals are too low) "
+        "even though its size is not.",
+        "",
         "**Dollar cost is NOT measured.** The Fireworks `/v1/models` endpoint returns no pricing "
         "field for these model IDs and this harness does not read a price list, so quoting a "
         "dollar figure would be a number we made up. What is measured is the token count in the "
@@ -424,6 +549,11 @@ def _repro(args: argparse.Namespace, models: dict[str, str], run_id: str) -> lis
         "",
         "# live: this run",
         "make eval UV=$HOME/.local/bin/uv   # == python -m evals.harness run",
+        "",
+        "# live, with the before/after section this report carries:",
+        f"python -m evals.harness run --baseline {args.baseline}"
+        if args.baseline
+        else "# (no --baseline was passed to this run)",
         "```",
         "",
         f"Models: primary `{models.get('primary')}`, weak `{models.get('weak')}`. "
@@ -453,6 +583,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     run.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     run.add_argument("--out", default=str(REPORTS_DIR))
     run.add_argument("--run-id")
+    run.add_argument(
+        "--baseline",
+        help="path to an earlier evals/reports/<run-id>.json; its recorded candidates are "
+        "re-scored with today's scorer to render a before/after section",
+    )
     run.add_argument("--fake", action="store_true", help="offline oracle client; not evidence")
     run.add_argument("--fake-corrupt", type=int, default=0)
     run.set_defaults(func=cmd_run)
@@ -461,6 +596,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "render", help="re-score and re-render a saved run JSON, offline, no API calls"
     )
     render.add_argument("report", help="path to an evals/reports/<run-id>.json")
+    render.add_argument(
+        "--baseline",
+        help="re-derive the before/after section against this earlier run's JSON; without it, "
+        "the section stored in the report being re-rendered is carried through unchanged",
+    )
     render.set_defaults(func=cmd_render)
 
     smoke = sub.add_parser("smoke", help="probe candidate weak models (D11)")

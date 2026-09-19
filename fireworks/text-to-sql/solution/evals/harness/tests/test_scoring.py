@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import pytest
 from evals.harness.corpus import CorpusItem, load_corpus
-from evals.harness.sandbox import ExecutionResult, fixtures
+from evals.harness.sandbox import ExecutionResult, Fixtures, fixtures
 from evals.harness.scoring import (
+    column_subset_match,
     compare_results,
     gold_is_order_sensitive,
     normalize_row,
@@ -331,3 +332,112 @@ def test_a_repair_exhausted_error_is_not_a_correct_abstention(built_fixtures):
     )
     assert not crashed.correct
     assert crashed.reason == "repair_exhausted_not_abstention"
+
+
+# ---------------------------------------------------------------------------
+# column_subset_accuracy (W12) — the secondary metric
+#
+# It exists to separate "right answer, wider projection" from "wrong answer".
+# Every test here pins one side of that line; the metric is never allowed to
+# start forgiving rows, values, or row order.
+# ---------------------------------------------------------------------------
+def test_extra_candidate_columns_pass_the_subset_metric_and_fail_the_strict_one() -> None:
+    """The retail-e01 shape: same rows, same filter, six columns instead of three."""
+    gold = result(["name", "category"], [["widget", "tools"], ["gizmo", "toys"]])
+    candidate = result(
+        ["id", "sku", "name", "category"],
+        [[1, "W-1", "widget", "tools"], [2, "G-1", "gizmo", "toys"]],
+    )
+    comparison = compare_results(gold, candidate, order_sensitive=True)
+    assert not comparison.match
+    assert comparison.reason == "column_count_mismatch"
+    assert comparison.match_column_subset
+
+
+def test_reordered_columns_pass_the_subset_metric() -> None:
+    gold = result(["name", "city"], [["ada", "oslo"], ["bob", "riga"]])
+    candidate = result(["city", "name"], [["oslo", "ada"], ["riga", "bob"]])
+    assert not compare_results(gold, candidate, order_sensitive=True).match
+    assert compare_results(gold, candidate, order_sensitive=True).match_column_subset
+
+
+def test_a_missing_gold_column_fails_the_subset_metric() -> None:
+    gold = result(["name", "city"], [["ada", "oslo"]])
+    candidate = result(["name", "email"], [["ada", "ada@example.com"]])
+    comparison = compare_results(gold, candidate, order_sensitive=False)
+    assert not comparison.match_column_subset
+
+
+def test_a_narrower_candidate_fails_the_subset_metric() -> None:
+    """A subset is one-directional: dropping a gold column is still wrong."""
+    gold = result(["name", "city"], [["ada", "oslo"]])
+    candidate = result(["name"], [["ada"]])
+    assert not compare_results(gold, candidate, order_sensitive=False).match_column_subset
+
+
+def test_a_value_mismatch_fails_the_subset_metric_even_with_extra_columns() -> None:
+    gold = result(["name", "total"], [["ada", 500]])
+    candidate = result(["id", "name", "total"], [[1, "ada", 501]])
+    comparison = compare_results(gold, candidate, order_sensitive=False)
+    assert not comparison.match
+    assert not comparison.match_column_subset
+
+
+def test_extra_rows_fail_the_subset_metric() -> None:
+    gold = result(["name"], [["ada"]])
+    candidate = result(["name", "id"], [["ada", 1], ["bob", 2]])
+    assert not compare_results(gold, candidate, order_sensitive=False).match_column_subset
+
+
+def test_the_subset_metric_still_honours_row_order_when_the_gold_sorts() -> None:
+    gold = result(["name"], [["ada"], ["bob"]])
+    candidate = result(["name", "id"], [["bob", 2], ["ada", 1]])
+    assert not column_subset_match(gold, candidate, order_sensitive=True)
+    assert column_subset_match(gold, candidate, order_sensitive=False)
+
+
+def test_the_subset_metric_keeps_numeric_leniency() -> None:
+    gold = result(["total"], [[500]])
+    candidate = result(["total", "label"], [[500.0, "x"]])
+    assert column_subset_match(gold, candidate, order_sensitive=False)
+
+
+def test_the_subset_metric_matches_by_value_not_by_column_name() -> None:
+    gold = result(["order_count"], [[3]])
+    candidate = result(["n", "customer"], [[3, "ada"]])
+    assert column_subset_match(gold, candidate, order_sensitive=False)
+
+
+def test_duplicate_valued_columns_do_not_confuse_the_assignment_search() -> None:
+    """Two candidate columns hold the same values; only one assignment works."""
+    gold = result(["a", "b"], [[1, 1], [2, 3]])
+    candidate = result(["x", "y", "z"], [[1, 1, 9], [2, 3, 9]])
+    assert column_subset_match(gold, candidate, order_sensitive=True)
+
+
+def test_a_strict_match_always_passes_the_subset_metric() -> None:
+    gold = result(["name", "city"], [["ada", "oslo"], ["bob", "riga"]])
+    comparison = compare_results(gold, gold, order_sensitive=True)
+    assert comparison.match
+    assert comparison.match_column_subset
+
+
+def test_score_item_carries_the_subset_verdict_for_a_widened_projection(
+    built_fixtures: Fixtures,
+) -> None:
+    """End to end on the real corpus item the W12 diagnosis was written from."""
+    item = next(i for i in load_corpus().items if i.id == "retail-e01")
+    widened = (
+        "SELECT id, sku, name, category, unit_price, discontinued_date "
+        "FROM products WHERE discontinued_date IS NOT NULL ORDER BY id"
+    )
+    score = score_item(item, response_class="valid", query=widened, fixtures=built_fixtures)
+    assert not score.correct
+    assert score.reason == "column_count_mismatch"
+    assert score.correct_column_subset
+
+
+def test_an_abstention_on_a_gold_item_is_not_a_subset_pass(built_fixtures: Fixtures) -> None:
+    item = next(i for i in load_corpus().items if not i.is_adversarial)
+    score = score_item(item, response_class="error", query=None, fixtures=built_fixtures)
+    assert not score.correct_column_subset

@@ -8,6 +8,13 @@ Gold items
     variant (names must match too) is computed alongside as a secondary number,
     so the report shows the leniency was chosen rather than assumed.
 
+    Two further secondary numbers are computed on the same execution, never in
+    place of the headline: ``correct_order_insensitive`` (how much of the score
+    hinges on row order) and ``correct_column_subset`` (W12: the gold's columns
+    are all present in the candidate's result with matching values per row,
+    extra columns ignored — how much of the score hinges on projection
+    agreement). See :func:`column_subset_match`.
+
 Adversarial items
     Pass iff ``response_class ∈ allowed_response_classes`` **and**, when
     ``forbid_ddl_dml`` is set, the ``query`` field carries no DDL/DML. That last
@@ -30,6 +37,7 @@ Two deliberate non-fixes, both reported rather than papered over:
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -44,6 +52,7 @@ from foundation.security import UnsafeQueryError, assert_safe_select
 __all__ = [
     "Comparison",
     "ItemScore",
+    "column_subset_match",
     "compare_results",
     "gold_is_order_sensitive",
     "normalize_row",
@@ -114,11 +123,93 @@ def gold_is_order_sensitive(gold_sql: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Column-subset comparison (W12) — the secondary metric
+# ---------------------------------------------------------------------------
+#: Ceiling on the number of gold→candidate column assignments tried before the
+#: subset search gives up and answers "no". Only reachable when a candidate
+#: returns many columns holding identical values; a bounded search that is
+#: honest about its bound beats an unbounded one that stalls the report.
+MAX_SUBSET_ASSIGNMENTS = 20_000
+
+
+def _assignments(
+    allowed: list[list[int]], used: frozenset[int] = frozenset(), index: int = 0
+) -> Iterator[tuple[int, ...]]:
+    """Every injective gold-column → candidate-column assignment, prefiltered."""
+    if index == len(allowed):
+        yield ()
+        return
+    for choice in allowed[index]:
+        if choice in used:
+            continue
+        for rest in _assignments(allowed, used | {choice}, index + 1):
+            yield (choice, *rest)
+
+
+def column_subset_match(
+    gold: ExecutionResult, candidate: ExecutionResult, *, order_sensitive: bool
+) -> bool:
+    """True iff every gold column is present in the candidate's result with the
+    same values on the same rows, ignoring any extra columns.
+
+    This is the W12 secondary metric. It exists to quantify one thing: how much
+    of the strict-accuracy gap is *projection disagreement* rather than a wrong
+    answer. A question that never said which columns to return cannot make the
+    gold's column list knowable, so "returned the right rows plus two extra
+    columns" and "returned the wrong rows" are different failures and were being
+    counted as the same one.
+
+    Deliberately weaker than the headline metric in exactly two ways, and no
+    others:
+
+    * extra candidate columns are ignored, and
+    * the gold's columns may appear in any position (column *order* is not
+      scored, since a superset has no meaningful positional alignment).
+
+    Everything else is held: the row multiset must match exactly, row *order*
+    still matters iff the gold query sorts, and values are compared with the
+    same numeric leniency. Matching is by **value**, never by column name —
+    the same choice design.md already fixed for the primary comparison.
+
+    Never reported instead of execution accuracy. Strict execution accuracy
+    stays the headline number; this one sits beside it.
+    """
+    n_gold, n_candidate = len(gold.columns), len(candidate.columns)
+    if n_gold == 0 or n_gold > n_candidate or len(gold.rows) != len(candidate.rows):
+        return False
+
+    gold_rows = [normalize_row(row) for row in gold.rows]
+    candidate_rows = [normalize_row(row) for row in candidate.rows]
+    gold_columns = [[row[i] for row in gold_rows] for i in range(n_gold)]
+    candidate_columns = [[row[i] for row in candidate_rows] for i in range(n_candidate)]
+
+    # Necessary condition, and a cheap one: if the projected rows are to equal
+    # the gold rows as a multiset, each chosen candidate column must hold the
+    # gold column's values as a multiset. Prunes the search to almost nothing.
+    allowed = [
+        [i for i in range(n_candidate) if Counter(candidate_columns[i]) == Counter(column)]
+        for column in gold_columns
+    ]
+    if any(not options for options in allowed):
+        return False
+
+    gold_bag = Counter(tuple(row) for row in gold_rows)
+    for tried, mapping in enumerate(_assignments(allowed), start=1):
+        if tried > MAX_SUBSET_ASSIGNMENTS:
+            return False
+        projected = [tuple(row[i] for i in mapping) for row in candidate_rows]
+        matched = projected == gold_rows if order_sensitive else Counter(projected) == gold_bag
+        if matched:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Comparison
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
 class Comparison:
-    """One gold-vs-candidate verdict, at three strictness levels."""
+    """One gold-vs-candidate verdict, at four strictness levels."""
 
     #: design.md policy: lenient names, order-sensitive iff gold has ORDER BY.
     match: bool
@@ -127,6 +218,10 @@ class Comparison:
     #: Diagnostic: multiset only, ignoring order entirely. Comparing this with
     #: ``match`` quantifies how much of the score hinges on row order.
     match_order_insensitive: bool
+    #: Secondary number (W12): the gold's columns are all present, with matching
+    #: values per row, regardless of extra columns. Comparing this with ``match``
+    #: quantifies how much of the score hinges on projection agreement.
+    match_column_subset: bool
     reason: str
     detail: str = ""
 
@@ -134,13 +229,21 @@ class Comparison:
 def compare_results(
     gold: ExecutionResult, candidate: ExecutionResult, *, order_sensitive: bool
 ) -> Comparison:
+    subset = column_subset_match(gold, candidate, order_sensitive=order_sensitive)
+
     if len(gold.columns) != len(candidate.columns):
         detail = (
             f"gold returned {len(gold.columns)} column(s) "
             f"{list(gold.columns)}, candidate returned {len(candidate.columns)} "
             f"{list(candidate.columns)}"
+            + (
+                "; the gold's columns are all present in the candidate's result "
+                "(column_subset passes)"
+                if subset
+                else ""
+            )
         )
-        return Comparison(False, False, False, "column_count_mismatch", detail)
+        return Comparison(False, False, False, subset, "column_count_mismatch", detail)
 
     gold_bag, candidate_bag = _multiset(gold.rows), _multiset(candidate.rows)
     bags_equal = gold_bag == candidate_bag
@@ -154,13 +257,14 @@ def compare_results(
         ordered_equal = bags_equal
 
     if ordered_equal:
-        return Comparison(True, names_equal, bags_equal, "match")
+        return Comparison(True, names_equal, bags_equal, subset, "match")
 
     if bags_equal:
         return Comparison(
             False,
             False,
             True,
+            subset,
             "order_mismatch",
             f"same {len(gold.rows)} row(s), different order; gold has a top-level ORDER BY",
         )
@@ -169,6 +273,7 @@ def compare_results(
             False,
             False,
             False,
+            subset,
             "row_count_mismatch",
             f"gold returned {len(gold.rows)} row(s), candidate returned {len(candidate.rows)}",
         )
@@ -178,6 +283,7 @@ def compare_results(
         False,
         False,
         False,
+        subset,
         "value_mismatch",
         f"{len(gold.rows)} row(s) either side; e.g. gold-only {missing}, candidate-only {extra}",
     )
@@ -232,6 +338,10 @@ class ItemScore:
     correct: bool
     correct_strict_names: bool
     correct_order_insensitive: bool
+    #: W12 secondary metric: every gold column present in the candidate's
+    #: result with matching values, extra columns ignored. Reported beside
+    #: ``correct``, never instead of it.
+    correct_column_subset: bool
     reason: str
     detail: str
     response_class: str | None
@@ -296,6 +406,7 @@ def _score_adversarial(
         correct=correct,
         correct_strict_names=correct,
         correct_order_insensitive=correct,
+        correct_column_subset=correct,
         reason=reason,
         detail=detail,
         response_class=response_class,
@@ -328,6 +439,7 @@ def _failed_gold_score(
         correct=False,
         correct_strict_names=False,
         correct_order_insensitive=False,
+        correct_column_subset=False,
         reason=reason,
         detail=detail,
         response_class=response_class,
@@ -411,6 +523,7 @@ def score_item(
         correct=comparison.match,
         correct_strict_names=comparison.match_strict_names,
         correct_order_insensitive=comparison.match_order_insensitive,
+        correct_column_subset=comparison.match_column_subset,
         reason=comparison.reason,
         detail=comparison.detail,
         response_class=response_class,

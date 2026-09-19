@@ -548,3 +548,76 @@ class TestTierStructure:
                 or _has_join(it["gold_sql"])
                 or _has_cte(it["gold_sql"])
             ), f"{it['id']}: looks like an unfiltered SELECT * with no other structure"
+
+
+# ---------------------------------------------------------------------------
+# 7. The revision record (W12)
+#
+# The corpus is the measuring instrument. Once it has been edited after a live
+# run, the record of *what* was edited is evidence in its own right, and an
+# audit log that can drift from the artefact it describes is worse than none.
+# These tests bind revisions.json to manifest.json and to REVISIONS.md.
+# ---------------------------------------------------------------------------
+
+REVISIONS_JSON = CORPUS_DIR / "revisions.json"
+REVISIONS_MD = CORPUS_DIR / "REVISIONS.md"
+
+
+@pytest.fixture(scope="session")
+def revisions() -> dict[str, Any]:
+    with REVISIONS_JSON.open() as f:
+        record: dict[str, Any] = json.load(f)
+    return record
+
+
+class TestRevisionRecord:
+    def test_both_revision_files_exist(self) -> None:
+        assert REVISIONS_JSON.exists(), "revisions.json is missing"
+        assert REVISIONS_MD.exists(), "REVISIONS.md is missing"
+
+    def test_every_gold_item_was_audited_exactly_once(
+        self, revisions: dict[str, Any], gold_items: list[dict[str, Any]]
+    ) -> None:
+        revised = [r["id"] for r in revisions["revised"]]
+        unchanged = [u["id"] for u in revisions["reviewed_unchanged"]]
+        audited = revised + unchanged
+        assert len(audited) == len(set(audited)), "an item is recorded twice"
+        assert set(audited) == {it["id"] for it in gold_items}, (
+            "the revision record must account for every gold item, and only gold items"
+        )
+
+    def test_the_after_text_is_what_the_manifest_actually_ships(
+        self, revisions: dict[str, Any], items: list[dict[str, Any]]
+    ) -> None:
+        by_id = {it["id"]: it for it in items}
+        for record in revisions["revised"]:
+            assert by_id[record["id"]]["question"] == record["after"], (
+                f"{record['id']}: REVISIONS.md's 'after' does not match the shipped question"
+            )
+            assert record["before"] != record["after"], f"{record['id']}: recorded a non-change"
+
+    def test_unchanged_items_are_really_unchanged_in_the_record(
+        self, revisions: dict[str, Any]
+    ) -> None:
+        revised_ids = {r["id"] for r in revisions["revised"]}
+        for record in revisions["reviewed_unchanged"]:
+            assert record["id"] not in revised_ids
+            assert record["why"].strip(), f"{record['id']}: no reason given for leaving it alone"
+
+    def test_every_revision_carries_a_justification(self, revisions: dict[str, Any]) -> None:
+        for record in revisions["revised"]:
+            assert len(record["justification"]) >= MIN_RATIONALE_CHARS, record["id"]
+            assert record["gold_sql_changed"] is False
+
+    def test_the_markdown_log_names_every_revised_item(self, revisions: dict[str, Any]) -> None:
+        text = REVISIONS_MD.read_text()
+        for record in revisions["revised"] + revisions["reviewed_unchanged"]:
+            assert f"`{record['id']}`" in text, f"{record['id']} is missing from REVISIONS.md"
+
+    def test_the_markdown_log_quotes_each_before_and_after_verbatim(
+        self, revisions: dict[str, Any]
+    ) -> None:
+        text = REVISIONS_MD.read_text()
+        for record in revisions["revised"]:
+            assert record["before"] in text, f"{record['id']}: 'before' text not in REVISIONS.md"
+            assert record["after"] in text, f"{record['id']}: 'after' text not in REVISIONS.md"
