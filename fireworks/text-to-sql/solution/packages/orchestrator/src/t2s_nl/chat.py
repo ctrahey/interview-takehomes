@@ -206,6 +206,22 @@ def _new(orch: Orchestrator) -> str:
     return "  started a fresh data model; describe the domain you want"
 
 
+def _readline_prompt(text: str, key: str = "cyan") -> str:
+    """Colour a prompt so readline still counts its width correctly.
+
+    readline measures the prompt to know where the cursor is. Raw ANSI escapes
+    are counted as printable, so a coloured prompt makes it believe the cursor
+    is ~9 columns further right than it is -- and the moment your input wraps,
+    it redraws over the start of the same line instead of onto a new one.
+    \001 and \002 (RL_PROMPT_START_IGNORE/END_IGNORE) mark the bytes to skip.
+    """
+    coloured = colorize(key, text)
+    if coloured == text:  # colour disabled: nothing to hide
+        return text
+    start, _, rest = coloured.partition(text)
+    return f"\001{start}\002{text}\001{rest}\002"
+
+
 def _setup_readline() -> None:
     if readline is None:  # pragma: no cover - Windows
         return
@@ -303,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
 
     while True:
         try:
-            line = input(colorize("cyan", "› ")).strip()
+            line = input(_readline_prompt("› ")).strip()
         except (EOFError, KeyboardInterrupt):
             print(flush=True)
             live.close()
