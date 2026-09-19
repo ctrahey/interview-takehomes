@@ -76,7 +76,14 @@ FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
 # get mounted -- created + chowned here so a *named* volume's first mount
 # (which Docker seeds from the image's existing directory) comes up writable
 # by `t2s` rather than root.
-RUN groupadd --system --gid 1000 t2s \
+# sqlite3 is here on purpose and is not a build dependency: it is how a human
+# checks the workbench's answer against the sample database by hand, with a
+# tool the workbench does not control. `t2s db path <id> --sql "..."` prints
+# the exact command. Roughly 1 MB.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends sqlite3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 1000 t2s \
     && useradd --system --uid 1000 --gid t2s --home-dir /home/t2s --create-home t2s \
     && mkdir -p /data/sample_dbs /data/foundation \
     && chown -R t2s:t2s /data /home/t2s

@@ -463,6 +463,37 @@ def db_list(as_json: bool) -> None:
         click.echo(f"{entry['database_id']}  {entry['size_bytes']} bytes")
 
 
+@db.command("path")
+@click.argument("database_id")
+@click.option("--sql", default=None, help="Print a ready-to-run sqlite3 command for this SQL.")
+def db_path(database_id: str, sql: str | None) -> None:
+    """Print the file path of a sample database, so you can query it by hand.
+
+    Accepts the short id the chat displays (`536c7b02`) as well as a full UUID,
+    because the point of this command is to be usable from what is already on
+    your screen. Verifying the workbench's answer against the file itself, with
+    a tool the workbench does not control, is the strongest check available.
+    """
+    directory = managed_directory()
+    wanted = database_id.replace("-", "").lower()
+    matches = sorted(p for p in directory.glob("*.sqlite3") if p.stem.startswith(wanted))
+    if not matches:
+        raise click.ClickException(
+            f"No sample database starting with {database_id!r} in {directory}"
+        )
+    if len(matches) > 1:
+        listed = "\n  ".join(m.stem[:12] for m in matches)
+        raise click.ClickException(f"{database_id!r} is ambiguous:\n  {listed}")
+
+    path = matches[0]
+    if sql is None:
+        click.echo(str(path))
+        return
+    # -readonly so an independent check can never be the thing that mutates
+    # the data it is checking.
+    click.echo(f'sqlite3 -readonly -header -box "{path}" "{sql}"')
+
+
 @db.command("destroy")
 @click.argument("database_id")
 @click.option("--yes", is_flag=True, default=False, help="Skip the confirmation prompt.")

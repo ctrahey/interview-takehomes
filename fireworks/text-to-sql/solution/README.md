@@ -52,6 +52,27 @@ schema the system had just designed seconds earlier, in a database with zero row
 This is the tier that makes a plausible-looking wrong answer hard to hand back. Unknown columns,
 unknown tables, bad `GROUP BY`, and syntax errors cannot survive it.
 
+### Verify it yourself, with a tool this system does not control
+
+The strongest check is not a transcript we wrote. Ask the chat a question, then go read the
+database by hand:
+
+```bash
+uv run t2s db path 536c7b02                      # the short id the chat prints
+uv run t2s db path 536c7b02 --sql "SELECT ..."   # a ready-to-run, read-only sqlite3 command
+```
+
+Paste the SQL the chat showed you and compare the rows. `sqlite3` is also in the container image
+for exactly this, so the same move works against the containerised stack:
+
+```bash
+docker compose run --rm --entrypoint sh chat -c \
+  'sqlite3 -readonly -header -box /data/sample_dbs/536c7b02*.sqlite3 "SELECT ..."'
+```
+
+The generated command is always `-readonly`: an independent check must never be the thing that
+mutates the data it is checking.
+
 ### Tier 2 — when a sample database has data
 
 The system will create a sample database from your schema, generate and load data into it, and
