@@ -48,7 +48,11 @@ def request_key(
     schema_name: str,
     max_tokens: int | None,
     temperature: float,
+    reasoning_effort: str | None = None,
 ) -> str:
+    # Only mixed into the key when actually set, so fixtures captured before
+    # this parameter existed keep their keys instead of all orphaning at once.
+    extra = {"reasoning_effort": reasoning_effort} if reasoning_effort is not None else {}
     material = _canonical(
         {
             "model": model,
@@ -57,6 +61,7 @@ def request_key(
             "schema_name": schema_name,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            **extra,
         }
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:KEY_LENGTH]
@@ -85,6 +90,7 @@ class RecordedClient:
         schema_name: str = "response",
         max_tokens: int | None = None,
         temperature: float = 0.0,
+        reasoning_effort: str | None = None,
     ) -> InferenceResponse:
         key = request_key(
             model=self.model,
@@ -92,6 +98,7 @@ class RecordedClient:
             response_schema=response_schema,
             schema_name=schema_name,
             max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
             temperature=temperature,
         )
         fixture = self._load(key)
@@ -148,12 +155,14 @@ class RecordingClient:
         schema_name: str = "response",
         max_tokens: int | None = None,
         temperature: float = 0.0,
+        reasoning_effort: str | None = None,
     ) -> InferenceResponse:
         response = self.inner.complete(
             messages,
             response_schema=response_schema,
             schema_name=schema_name,
             max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
             temperature=temperature,
         )
         key = request_key(
@@ -162,6 +171,7 @@ class RecordingClient:
             response_schema=response_schema,
             schema_name=schema_name,
             max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
             temperature=temperature,
         )
         path = self.fixture_dir / f"{key}.json"

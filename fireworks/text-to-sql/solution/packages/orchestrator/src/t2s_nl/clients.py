@@ -74,6 +74,7 @@ class ChainedRecordedClient:
         schema_name: str = "response",
         max_tokens: int | None = None,
         temperature: float = 0.0,
+        reasoning_effort: str | None = None,
     ) -> InferenceResponse:
         last: FixtureNotFound | None = None
         for client in self._clients:
@@ -84,6 +85,7 @@ class ChainedRecordedClient:
                     schema_name=schema_name,
                     max_tokens=max_tokens,
                     temperature=temperature,
+                    reasoning_effort=reasoning_effort,
                 )
             except FixtureNotFound as exc:
                 last = exc

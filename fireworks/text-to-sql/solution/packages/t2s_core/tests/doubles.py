@@ -61,6 +61,7 @@ class ScriptedClient:
         schema_name: str = "response",
         max_tokens: int | None = None,
         temperature: float = 0.0,
+        reasoning_effort: str | None = None,
     ) -> InferenceResponse:
         self.calls.append(list(messages))
         self.max_tokens_seen.append(max_tokens)

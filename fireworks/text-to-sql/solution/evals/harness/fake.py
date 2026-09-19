@@ -57,6 +57,7 @@ class FakeOracleClient:
         schema_name: str = "response",
         max_tokens: int | None = None,
         temperature: float = 0.0,
+        reasoning_effort: str | None = None,
     ) -> InferenceResponse:
         self.calls += 1
         prompt = "\n".join(m.content for m in messages if m.role == "user")

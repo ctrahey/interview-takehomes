@@ -60,6 +60,7 @@ class ScriptedClient:
         schema_name: str = "response",
         max_tokens: int | None = None,
         temperature: float = 0.0,
+        reasoning_effort: str | None = None,
     ) -> InferenceResponse:
         self.calls.append(Call(list(messages), schema_name))
         if schema_name == ROUTER_SCHEMA_NAME:
@@ -106,6 +107,7 @@ class TripwireClient:
         schema_name: str = "response",
         max_tokens: int | None = None,
         temperature: float = 0.0,
+        reasoning_effort: str | None = None,
     ) -> InferenceResponse:
         self.calls.append(Call(list(messages), schema_name))
         return self.inner.complete(
@@ -176,6 +178,7 @@ class ExplodingClient:
         schema_name: str = "response",
         max_tokens: int | None = None,
         temperature: float = 0.0,
+        reasoning_effort: str | None = None,
     ) -> InferenceResponse:
         raise AssertionError(
             "an inference call was made on a path that must be fully deterministic"

@@ -29,7 +29,10 @@ logger = logging.getLogger("t2s_nl.router")
 
 #: The decision is a handful of short fields. Generous enough that finding #1's
 #: truncation trap is not reachable here in practice, small enough to be cheap.
-ROUTER_MAX_TOKENS = 600
+# Generous because the failure mode is a dead turn, not a cost: with
+# reasoning disabled the router answers in ~110 tokens, so this ceiling is
+# never approached in practice and exists only to bound a pathological reply.
+ROUTER_MAX_TOKENS = 1500
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +95,12 @@ def route(
             response_schema=ROUTER_SCHEMA,
             schema_name=ROUTER_SCHEMA_NAME,
             max_tokens=ROUTER_MAX_TOKENS,
+            # Measured: classifying a compound utterance cost ~1970 reasoning
+            # tokens and truncated at both 600 and 1200, because reasoning
+            # expands to fill the budget it is given. Disabling it answers the
+            # same classification in 111 tokens. This is a routing decision over
+            # a fixed enum, not a problem that benefits from deliberation.
+            reasoning_effort="none",
             temperature=0.0,
         )
     except T2SError as exc:

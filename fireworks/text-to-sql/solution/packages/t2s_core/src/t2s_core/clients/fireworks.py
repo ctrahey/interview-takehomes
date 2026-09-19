@@ -82,10 +82,18 @@ class FireworksClient:
         schema_name: str = "response",
         max_tokens: int | None = None,
         temperature: float = 0.0,
+        reasoning_effort: str | None = None,
     ) -> InferenceResponse:
         budget = max_tokens or self.config.max_tokens
         try:
-            return self._complete_once(messages, response_schema, schema_name, budget, temperature)
+            return self._complete_once(
+                messages,
+                response_schema,
+                schema_name,
+                max_tokens=budget,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+            )
         except TruncatedResponse as first:
             escalated = int(budget * self.config.truncation_retry_factor)
             logger.warning(
@@ -95,7 +103,12 @@ class FireworksClient:
                 first.request_id,
             )
             return self._complete_once(
-                messages, response_schema, schema_name, escalated, temperature
+                messages,
+                response_schema,
+                schema_name,
+                max_tokens=escalated,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
             )
 
     # -----------------------------------------------------------------------
@@ -104,8 +117,10 @@ class FireworksClient:
         messages: Sequence[Message],
         response_schema: Mapping[str, Any],
         schema_name: str,
+        *,
         max_tokens: int,
         temperature: float,
+        reasoning_effort: str | None = None,
     ) -> InferenceResponse:
         payload: dict[str, Any] = {
             "model": self.config.model,
@@ -114,6 +129,13 @@ class FireworksClient:
             "max_tokens": max_tokens,
             "response_format": response_format(dict(response_schema), schema_name),
         }
+        if reasoning_effort is not None:
+            # Measured on the router call: this model spends ~1970 reasoning
+            # tokens classifying a compound utterance and expands to fill
+            # whatever budget it is given, so raising max_tokens alone does not
+            # stop the truncation. "none" answers the same classification in
+            # 111 tokens. Generation calls leave this unset and keep reasoning.
+            payload["reasoning_effort"] = reasoning_effort
         started = time.perf_counter()
         response = self._post_with_retries(payload)
         latency_ms = int((time.perf_counter() - started) * 1000)
