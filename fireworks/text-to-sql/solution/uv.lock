@@ -12,6 +12,7 @@ members = [
     "t2s-api",
     "t2s-cli",
     "t2s-core",
+    "t2s-nl",
     "t2s-workspace",
 ]
 
@@ -960,6 +961,25 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "pydantic", specifier = ">=2.8" },
     { name = "sqlglot", specifier = ">=25.0" },
+]
+
+[[package]]
+name = "t2s-nl"
+version = "0.1.0"
+source = { editable = "packages/orchestrator" }
+dependencies = [
+    { name = "foundation" },
+    { name = "pydantic" },
+    { name = "sqlglot" },
+    { name = "t2s-core" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "foundation", editable = "packages/foundation" },
+    { name = "pydantic", specifier = ">=2.8" },
+    { name = "sqlglot", specifier = ">=25.0" },
+    { name = "t2s-core", editable = "packages/t2s_core" },
 ]
 
 [[package]]

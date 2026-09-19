@@ -394,7 +394,10 @@ class _TableAccumulator:
         fk = _parse_reference(reference, _identifiers(inner.expressions))
         fk.name = name
         key = (tuple(fk.columns), fk.ref_table, tuple(fk.ref_columns))
-        if any((tuple(e.columns), e.ref_table, tuple(e.ref_columns)) == key for e in self.foreign_keys):
+        existing = (
+            (tuple(e.columns), e.ref_table, tuple(e.ref_columns)) for e in self.foreign_keys
+        )
+        if any(candidate == key for candidate in existing):
             # Structurally identical to one already recorded (e.g. a source
             # file that repeats the same `ALTER TABLE ... ADD FOREIGN KEY`) --
             # fold silently rather than duplicate the constraint in the graph.
@@ -583,7 +586,9 @@ _SERIAL_TYPES = {
 }
 
 
-def _resolve_column_type(dt: exp.DataType, table_name: str, col_name: str) -> tuple[str, str | None]:
+def _resolve_column_type(
+    dt: exp.DataType, table_name: str, col_name: str
+) -> tuple[str, str | None]:
     serial_type = _SERIAL_TYPES.get(dt.this)
     if serial_type is None:
         return _type_to_str(dt), None

@@ -30,6 +30,7 @@ target-version = "py312"
 src = [
     "packages/t2s_core/src",
     "packages/foundation/src",
+    "packages/orchestrator/src",
     "packages/api/src",
     "packages/cli/src",
 ]
@@ -52,12 +53,14 @@ python_version = "3.12"
 mypy_path = [
     "packages/t2s_core/src",
     "packages/foundation/src",
+    "packages/orchestrator/src",
     "packages/api/src",
     "packages/cli/src",
 ]
 files = [
     "packages/t2s_core/src",
     "packages/foundation/src",
+    "packages/orchestrator/src",
     "packages/api/src",
     "packages/cli/src",
 ]
@@ -78,6 +81,7 @@ ignore_missing_imports = true
 testpaths = [
     "packages/t2s_core/tests",
     "packages/foundation/tests",
+    "packages/orchestrator/tests",
     "packages/api/tests",
     "packages/cli/tests",
     "tests",
@@ -90,10 +94,26 @@ asyncio_mode = "auto"
 # import-linter — the t2s_core ↛ foundation contract (D4 / design §1)
 # ---------------------------------------------------------------------------
 [tool.importlinter]
-root_packages = ["t2s_core", "foundation", "t2s_api", "t2s_cli"]
+root_packages = ["t2s_core", "foundation", "t2s_nl", "t2s_api", "t2s_cli"]
 
 [[tool.importlinter.contracts]]
-name = "t2s_core must not depend on foundation, t2s_api, or t2s_cli"
+name = "t2s_core must not depend on foundation, t2s_nl, t2s_api, or t2s_cli"
 type = "forbidden"
 source_modules = ["t2s_core"]
-forbidden_modules = ["foundation", "t2s_api", "t2s_cli"]
+forbidden_modules = ["foundation", "t2s_nl", "t2s_api", "t2s_cli"]
+
+# foundation owns persistence and must stay usable without the orchestrator or
+# any inference: it may not reach up into layer 3 or the surfaces above it.
+[[tool.importlinter.contracts]]
+name = "foundation must not depend on t2s_nl, t2s_api, or t2s_cli"
+type = "forbidden"
+source_modules = ["foundation"]
+forbidden_modules = ["t2s_nl", "t2s_api", "t2s_cli"]
+
+# Layer 3 is the ONE package allowed to depend on both lower layers (MAIN.md
+# §Natural Language). It must not depend on the surfaces built on top of it.
+[[tool.importlinter.contracts]]
+name = "t2s_nl must not depend on t2s_api or t2s_cli"
+type = "forbidden"
+source_modules = ["t2s_nl"]
+forbidden_modules = ["t2s_api", "t2s_cli"]

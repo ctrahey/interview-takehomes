@@ -1,0 +1,258 @@
+"""``t2s-chat`` — the conversational surface.
+
+A plain readline REPL, deliberately not a full-screen TUI: the transcript has to
+stay in the scrollback so SQL can be selected and copied, and so a session can
+be pasted into a report.
+
+Design notes that are requirements, not taste:
+
+* Slash commands are a **shortcut, not the interface**. Every one of them has a
+  plain-English equivalent that goes through the router. They exist because
+  ``/dbs`` is faster to type than "show me my databases", and because they never
+  call a model -- so the workbench stays usable when inference is down.
+* ``clarification_needed`` and ``error`` are ordinary turns. Nothing here prints
+  a traceback for an expected condition; unexpected exceptions print one line
+  with the type and message, and ``T2S_DEBUG=1`` for the rest.
+* The API key is never printed, never logged, and never interpolated anywhere.
+"""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import contextlib
+import os
+import sys
+import traceback
+from collections.abc import Callable
+from pathlib import Path
+from types import ModuleType
+
+try:  # pragma: no cover - present on every platform we target
+    import readline
+except ImportError:  # pragma: no cover - Windows without pyreadline
+    readline = None  # type: ignore[assignment]
+
+from t2s_nl.clients import is_offline, make_client
+from t2s_nl.orchestrator import HELP_TEXT, Orchestrator
+from t2s_nl.render import colorize, pretty_sql, render_table, render_turn
+from t2s_nl.store import Store
+from t2s_nl.turns import Turn
+
+__all__ = ["main", "run_command"]
+
+HISTORY_FILE = Path.home() / ".t2s" / "chat_history"
+
+SLASH_HELP = """\
+  /state          where am I: current model, schema, database, last query
+  /models         saved data models        /dbs        sample databases
+  /schemas        saved schemas            /queries    queries in this session
+  /schema [table] the current schema's columns
+  /rows <table>   some rows from the loaded sample database
+  /sql            the current SQL          /run        run it
+  /fix <text>     record a corrective and re-ask the last question
+  /correctives    what I've been told about this model
+  /new            start a fresh data model in this session
+  /help  /quit
+
+All of these can also just be said in English."""
+
+
+def _banner(orch: Orchestrator) -> str:
+    mode = "offline (recorded fixtures)" if is_offline() else f"model {orch.client.model}"
+    return "\n".join(
+        [
+            colorize("bold", "text-to-SQL — conversational workbench"),
+            colorize("dim", f"  {mode}"),
+            colorize("dim", f"  session {orch.store.session_id} · state in {orch.store.url}"),
+            colorize("dim", "  describe a domain, ask a question, or /help"),
+            "",
+        ]
+    )
+
+
+#: Slash command -> the deterministic catalogue read it stands for. Every one of
+#: these is also reachable in plain English through the router; the shortcut
+#: exists because it is faster to type and because it keeps working when
+#: inference does not.
+_CATALOGUE_COMMANDS: dict[str, str] = {
+    "/state": "state",
+    "/models": "models",
+    "/dbs": "databases",
+    "/schemas": "schemas",
+    "/queries": "queries",
+    "/correctives": "correctives",
+}
+
+_TABLE_COMMANDS: dict[str, str] = {
+    "/schema": "schema_detail",
+    "/rows": "sample_rows",
+}
+
+
+def _inspection_turn(orch: Orchestrator, target: str, argument: str | None = None) -> Turn:
+    return Turn(
+        intent="inspect",
+        table=orch.catalogue(target, table=argument),
+        deterministic_answer=True,
+    )
+
+
+def run_command(orch: Orchestrator, line: str) -> Turn | str | None:
+    """Handle a slash command. Returns a Turn, a plain string, or None to quit.
+
+    Deterministic all the way through -- not one of these makes an inference
+    call, which is what makes them the right thing to reach for when the model
+    or the network is misbehaving.
+    """
+    command, _, argument = line.partition(" ")
+    argument = argument.strip()
+
+    if command in _CATALOGUE_COMMANDS:
+        return _inspection_turn(orch, _CATALOGUE_COMMANDS[command])
+    if command in _TABLE_COMMANDS:
+        return _inspection_turn(orch, _TABLE_COMMANDS[command], argument or None)
+
+    handlers: dict[str, Callable[[], Turn | str | None]] = {
+        "/quit": lambda: None,
+        "/exit": lambda: None,
+        "/q": lambda: None,
+        "/help": lambda: HELP_TEXT + "\n\n" + SLASH_HELP,
+        "/sql": lambda: _current_sql(orch),
+        "/run": orch.run_current_sql,
+        "/fix": lambda: _fix(orch, argument),
+        "/new": lambda: _new(orch),
+    }
+    handler = handlers.get(command)
+    if handler is None:
+        return f"  unknown command {command} — /help"
+    return handler()
+
+
+def _current_sql(orch: Orchestrator) -> Turn | str:
+    sql = orch.current_sql()
+    if not sql:
+        return "  no current SQL"
+    return Turn(intent="inspect", sql=sql, deterministic_answer=True)
+
+
+def _fix(orch: Orchestrator, argument: str) -> Turn | str:
+    if not argument:
+        return "  usage: /fix <a fact about your domain>"
+    return orch.add_corrective(argument)
+
+
+def _new(orch: Orchestrator) -> str:
+    orch.start_new_model()
+    return "  started a fresh data model; describe the domain you want"
+
+
+def _setup_readline() -> None:
+    if readline is None:  # pragma: no cover - Windows
+        return
+    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError, ValueError):
+        readline.read_history_file(HISTORY_FILE)
+    readline.set_history_length(1000)
+    atexit.register(_save_history, readline)
+
+
+def _save_history(readline_module: ModuleType) -> None:  # pragma: no cover - atexit
+    with contextlib.suppress(OSError, AttributeError):
+        readline_module.write_history_file(HISTORY_FILE)
+
+
+def _emit(value: Turn | str | None, *, dialect: str, max_rows: int) -> None:
+    if value is None:
+        return
+    if isinstance(value, str):
+        print(value, flush=True)
+        return
+    if value.table is not None and value.table.caption and not value.text:
+        # An empty table renders as the caption sentence itself; printing the
+        # caption here too would say it twice.
+        if value.table.rows:
+            print(colorize("dim", f"  {value.table.caption}"), flush=True)
+        for line in render_table(value.table, max_rows=max_rows):
+            print(line, flush=True)
+        return
+    if value.sql and not value.text and value.table is None:
+        for line in pretty_sql(value.sql, dialect).splitlines():
+            print(f"    {line}", flush=True)
+        return
+    print(render_turn(value, dialect=dialect, max_rows=max_rows), flush=True)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="t2s-chat", description="Converse with the text-to-SQL workbench."
+    )
+    parser.add_argument("--session", help="Named session slug; omit for the default session.")
+    parser.add_argument("--db-url", help="Override the foundation metadata store URL.")
+    parser.add_argument("--dialect", default="sqlite", choices=["sqlite", "postgres", "mysql"])
+    parser.add_argument("--max-rows", type=int, default=25, help="Rows to print per table.")
+    parser.add_argument("--ask", action="append", help="Run one utterance and exit; repeatable.")
+    args = parser.parse_args(argv)
+
+    try:
+        client = make_client()
+    except RuntimeError as exc:
+        print(f"t2s-chat: {exc}", file=sys.stderr)
+        return 2
+
+    store = Store(args.db_url, session_slug=args.session)
+    orch = Orchestrator(client=client, store=store, dialect=args.dialect)
+
+    if args.ask:
+        for utterance in args.ask:
+            print(colorize("cyan", f"› {utterance}"), flush=True)
+            result = _one_line(orch, utterance)
+            if result is None:  # a /quit in the middle of a scripted run
+                return 0
+            _emit(result, dialect=args.dialect, max_rows=args.max_rows)
+        return 0
+
+    _setup_readline()
+    print(_banner(orch), flush=True)
+
+    while True:
+        try:
+            line = input(colorize("cyan", "› ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            print(flush=True)
+            return 0
+        if not line:
+            continue
+        result = _one_line(orch, line)
+        if result is None:
+            return 0
+        _emit(result, dialect=args.dialect, max_rows=args.max_rows)
+
+
+def _one_line(orch: Orchestrator, line: str) -> Turn | str | None:
+    """Dispatch one line of input. ``None`` means "the user asked to quit".
+
+    Slash commands take this branch in *both* the interactive loop and ``--ask``
+    mode -- scripted runs must take the same deterministic path an interactive
+    user does, or a transcript stops being evidence of what the REPL does.
+    """
+    if line.startswith("/"):
+        return run_command(orch, line)
+    return _safely(orch, line)
+
+
+def _safely(orch: Orchestrator, utterance: str) -> Turn:
+    """Last line of defence. Expected conditions are already Turns by here."""
+    try:
+        return orch.handle(utterance)
+    except Exception as exc:  # noqa: BLE001 - a chat loop must not die on one turn
+        if os.environ.get("T2S_DEBUG"):
+            traceback.print_exc()
+        return Turn.error(
+            f"Something went wrong handling that ({type(exc).__name__}: {exc}). "
+            "The session is intact; try again or use /state."
+        )
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
